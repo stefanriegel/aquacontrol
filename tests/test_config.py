@@ -59,7 +59,7 @@ class AppConfigTest(unittest.TestCase):
         self.assertEqual(cfg.fan_name(0, "x"), "Pumpe")
         self.assertEqual(cfg.fan_name(3, "Fan 4"), "Gehäuselüfter")
         self.assertEqual(cfg.min_percent(), {0: 25.0})
-        self.assertEqual(len(cfg.rules()), 2)
+        self.assertEqual(cfg.rules(), [])  # no schedule by default: a fresh install never writes on its own
         self.assertEqual(cfg.led_name(0, "LED Controller 1"), "LED Controller 1")
 
     def _cfg(self, raw):
@@ -92,10 +92,11 @@ class AppConfigTest(unittest.TestCase):
 
     def test_set_rules_invalid_keeps_old(self):
         cfg = AppConfig(self.path)
+        cfg.set_rules([{"time": "22:00", "target": "strip", "on": False}])
         with self.assertRaises(ScheduleError):
             cfg.set_rules([{"time": "99:00", "on": True}])
-        self.assertEqual(len(cfg.rules()), 2)
-        self.assertFalse(self.path.exists())
+        self.assertEqual(len(cfg.rules()), 1)
+        self.assertEqual(json.loads(self.path.read_text())["schedule"][0]["time"], "22:00")
 
     def test_corrupt_file(self):
         self.path.write_text("{")

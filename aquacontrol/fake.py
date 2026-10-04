@@ -57,7 +57,7 @@ class FakeTransport:
             if not self.ignore_writes:
                 self.settings = report
 
-    def write_output(self, report: bytes) -> None:
+    def send_commit(self, report: bytes) -> None:
         self._check()
         assert report == COMMIT_REPORT
         self.commits += 1

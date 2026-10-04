@@ -63,7 +63,7 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(self.fake.settings, self.original)
 
     def test_readback_oserror_rolls_back(self):
-        self.fake.read_faults = [OSError("fake: read failed")]
+        self.fake.read_faults = [OSError("fake: read failed")] * 2  # the retry fails as well
         with self.assertRaises(DeviceError) as cm:
             self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
         self.assertIn("wiederhergestellt", str(cm.exception))
@@ -71,8 +71,40 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(self.fake.writes[1], self.original)
         self.assertEqual(self.fake.settings, self.original)
 
+    def _count_settings_reads(self):
+        reads = []
+        real_get = self.fake.get_feature
+
+        def get_feature(report_id, length):
+            reads.append(report_id)
+            return real_get(report_id, length)
+
+        self.fake.get_feature = get_feature
+        return reads
+
+    def test_transient_readback_error_is_retried_without_rollback(self):
+        for fault in (OSError("fake: read failed"), "corrupt"):
+            with self.subTest(fault=fault):
+                self.fake.settings, self.fake.writes, self.fake.commits = self.original, [], 0
+                self.fake.read_faults = [fault]  # only the first read-back fails
+                result = self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0), backup=False)
+                self.assertTrue(result.changed)
+                self.assertEqual(len(self.fake.writes), 1)  # no rollback write
+                self.assertEqual(self.fake.commits, 1)
+                self.assertEqual(self.fake.settings, self.fake.writes[0])
+
+    def test_mismatch_rolls_back_without_retry(self):
+        self.fake.ignore_writes = True  # read-back succeeds but differs: VerifyError
+        reads = self._count_settings_reads()
+        with self.assertRaises(DeviceError) as cm:
+            self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0), backup=False)
+        self.assertIn("wiederhergestellt", str(cm.exception))
+        # initial read + one read-back + one rollback read-back: the mismatch is not read again
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(len(self.fake.writes), 2)
+
     def test_readback_crc_corrupt_rolls_back(self):
-        self.fake.read_faults = ["corrupt"]
+        self.fake.read_faults = ["corrupt"] * 2
         with self.assertRaises(DeviceError) as cm:
             self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
         self.assertIn("wiederhergestellt", str(cm.exception))
@@ -80,7 +112,7 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(self.fake.settings, self.original)
 
     def test_rollback_verification_failure_is_reported(self):
-        self.fake.read_faults = [OSError("fake: read failed"), "corrupt"]
+        self.fake.read_faults = [OSError("fake: read failed")] * 2 + ["corrupt"] * 2
         with self.assertRaises(DeviceError) as cm:
             self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
         self.assertIn("nicht bestätigt", str(cm.exception))
@@ -88,7 +120,7 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(len(self.fake.writes), 2)
 
     def test_rollback_write_failure_is_reported(self):
-        self.fake.read_faults = [OSError("fake: read failed")]
+        self.fake.read_faults = [OSError("fake: read failed")] * 2
         real_set = self.fake.set_feature
 
         def set_feature(report):

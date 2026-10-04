@@ -1,8 +1,11 @@
+import tempfile
 import threading
 import unittest
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 from aquacontrol import protocol as p
+from aquacontrol.config import AppConfig
 from aquacontrol.device import Device, DeviceError
 from aquacontrol.fake import FakeTransport
 from aquacontrol.schedule import (Override, Rule, ScheduleError, Scheduler, StripState, desired_state,
@@ -113,6 +116,21 @@ class SchedulerTest(unittest.TestCase):
         sched = Scheduler(self.dev, lambda: [], clock=lambda: self.now)
         self.assertIsNone(sched.tick())
         self.assertEqual(self.fake.writes, [])
+
+    def test_default_config_makes_no_write_at_night(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sched = Scheduler(self.dev, AppConfig(Path(tmp, "config.json")).rules, clock=lambda: self.now)
+            self.assertEqual(self.now, at(5, 3, 0))
+            self.assertIsNone(sched.tick())
+        self.assertEqual(self.fake.writes, [])
+        self.assertEqual(self.fake.commits, 0)
+
+    def test_override_applies_without_rules(self):
+        sched = Scheduler(self.dev, lambda: [], clock=lambda: self.now)
+        sched.set_override(False, 40)
+        self.assertTrue(sched.tick().changed)
+        s = self.dev.read_settings()
+        self.assertEqual((s.strip_enabled, s.strip_brightness), (False, 40))
 
     def test_status(self):
         st = self.sched.status()

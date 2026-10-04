@@ -49,12 +49,15 @@ def find_hidraw(sys_root: str | Path = "/sys/class/hidraw") -> str | None:
 class Transport(Protocol):
     def get_feature(self, report_id: int, length: int) -> bytes: ...
     def set_feature(self, report: bytes) -> None: ...
-    def write_output(self, report: bytes) -> None: ...
+    def send_commit(self, report: bytes) -> None: ...
 
 
 class HidrawTransport:
-    def __init__(self, find: Callable[[], str | None] = find_hidraw):
+    def __init__(self, find: Callable[[], str | None] = find_hidraw, commit_as: str = "feature"):
+        if commit_as not in ("feature", "output"):
+            raise ValueError(f"commit_as muss 'feature' oder 'output' sein, nicht {commit_as!r}")
         self._find = find
+        self._commit_as = commit_as
         self._last = 0.0
 
     def _open(self, flags: int) -> int:
@@ -92,7 +95,12 @@ class HidrawTransport:
             os.close(fd)
             self._done()
 
-    def write_output(self, report: bytes) -> None:
+    def send_commit(self, report: bytes) -> None:
+        """Send the commit report. Like the kernel driver (aqc_send_ctrl_data) this is a Feature report
+        (SET_REPORT, type feature) by default; commit_as="output" sends it as an Output report instead."""
+        if self._commit_as == "feature":
+            self.set_feature(report)
+            return
         self._pace()
         fd = self._open(os.O_RDWR)
         try:

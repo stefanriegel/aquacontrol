@@ -225,9 +225,14 @@ class App:
             raise BadRequest("enabled muss true oder false sein")
         if brightness is not None and (isinstance(brightness, bool) or not isinstance(brightness, int)):
             raise BadRequest("brightness muss eine Ganzzahl sein")
-        result = self.device.apply(lambda s: p.with_strip(s, enabled=enabled, brightness=brightness),
-                                   reason="strip")
-        return {"ok": True, "changed": result.changed, "backup": result.backup}
+        if brightness is not None and not 0 <= brightness <= 255:
+            raise BadRequest("brightness muss zwischen 0 und 255 liegen")  # never leave a bad override behind
+        # Every manual change goes through the scheduler override, so the next tick does not revert it.
+        # Schedule writes create no backup, by design.
+        on = enabled if enabled is not None else self.device.read_settings().strip_enabled
+        self.scheduler.set_override(on, brightness)
+        result = self.scheduler.tick()
+        return {"ok": True, "changed": bool(result and result.changed), "backup": None}
 
     def schedule_json(self) -> dict:
         return {"rules": rules_to_json(self.config.rules()), **self.scheduler.status()}

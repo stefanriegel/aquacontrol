@@ -60,7 +60,10 @@ class BackupStore:
         path = self.dir / name
         if not path.is_file():
             raise BackupError(f"Backup {name} existiert nicht")
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise BackupError(f"Backup {name} nicht lesbar: {e.strerror or e}") from e
         try:
             check_settings_report(data)
         except ValueError as e:

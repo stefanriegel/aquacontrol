@@ -4,7 +4,6 @@ Description=Push GPU sensors to aquacontrol
 [Service]
 Type=oneshot
 TimeoutStartSec=10
-LogLevelMax=notice
 EnvironmentFile=/etc/aquacontrol-push.env
 ExecStart=/usr/local/bin/aquacontrol-push-gpu.sh
 DynamicUser=yes

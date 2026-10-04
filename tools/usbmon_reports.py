@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract HID SET_REPORT writes to the QUADRO from a usbmon pcap and diff settings reports.
+"""Extract HID SET_REPORT writes (and interrupt/bulk OUT transfers) to the QUADRO from a usbmon pcap and diff settings reports.
 
 Capture on the Proxmox host while aquasuite (VM) talks to the device:
     modprobe usbmon; tcpdump -i usbmon3 -s 0 -w /root/aq.pcap
@@ -28,6 +28,7 @@ class SetReport:
     report_type: str
     report_id: int
     data: bytes
+    endpoint: int | None = None   # only for interrupt/bulk OUT transfers
 
 
 def parse_pcap(path: str | Path, devnum: int | None = None) -> list[SetReport]:
@@ -49,7 +50,19 @@ def parse_pcap(path: str | Path, devnum: int | None = None) -> list[SetReport]:
             continue
         ev_type, xfer, dev = chr(pkt[8]), pkt[9], pkt[11]
         flag_setup = pkt[14]
-        if ev_type != "S" or xfer != 2 or flag_setup != 0 or (devnum is not None and dev != devnum):
+        if ev_type != "S" or (devnum is not None and dev != devnum):
+            continue
+        if xfer in (1, 3):  # interrupt / bulk OUT submission to the device (endpoint without the 0x80 bit)
+            endpoint = pkt[10]
+            if endpoint & 0x80:
+                continue
+            data = bytes(pkt[64:])
+            if not data:
+                continue
+            kind = "intout" if xfer == 1 else "bulkout"
+            out.append(SetReport(len(out) + 1, ts_sec + ts_usec / 1e6, kind, data[0], data, endpoint))
+            continue
+        if xfer != 2 or flag_setup != 0:
             continue
         bm_request_type, b_request, w_value, _w_index, w_length = struct.unpack_from("<BBHHH", pkt, 40)
         if bm_request_type != 0x21 or b_request != 0x09:   # class/interface OUT, SET_REPORT
@@ -68,7 +81,10 @@ def extract(pcap: str, outdir: str, devnum: int | None = None) -> None:
     dest = Path(outdir)
     dest.mkdir(parents=True, exist_ok=True)
     for r in parse_pcap(pcap, devnum):
-        name = f"{r.seq:03d}_{r.report_type}{r.report_id:02x}.bin"
+        if r.endpoint is not None:
+            name = f"{r.seq:03d}_{r.report_type}_ep{r.endpoint:02x}.bin"
+        else:
+            name = f"{r.seq:03d}_{r.report_type}{r.report_id:02x}.bin"
         (dest / name).write_bytes(r.data)
         print(f"{name}  {len(r.data):4d} bytes  t={r.ts:.3f}")
 

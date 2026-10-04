@@ -65,7 +65,8 @@ Ein kleiner Daemon `aquacontrol` läuft direkt auf dem Host und bietet per Web-O
   Dekodierung). Alle Werte sind Big-Endian, Temperaturen und Prozent jeweils ×100.
   - Input-Report `0x01` (220 Byte): Live-Werte, ca. 1×/s.
   - Feature-Report `0x03` (961 Byte): Einstellungen. Am Ende steht eine CRC-16/USB über die Bytes 1..958.
-  - Output-Report `0x02` (11 Byte, fix `02 00 00 00 02 00 00 00 00 34 c6`): Übernehmen/Speichern.
+  - Report `0x02` (11 Byte, fix `02 00 00 00 02 00 00 00 00 34 c6`): Übernehmen/Speichern. Der Kernel-Treiber
+    sendet ihn als **Feature-Report** (SET_REPORT, Typ Feature).
   - Payload-Offsets der Einstellungen:
     - 9: Sensor-Offsets
     - 17: FanConfig[4] à 9 Byte
@@ -95,7 +96,7 @@ Python 3.13 (Debian 13), **nur Standardbibliothek**: keine pip-Pakete auf dem Hy
 aquacontrol/
   aquacontrol/
     protocol.py   # reines Byte-Format: CRC, decode/encode Settings + Status. Keine I/O.
-    transport.py  # hidraw: Feature lesen/schreiben (ioctl), Output-Report, Input lesen
+    transport.py  # hidraw: Feature lesen/schreiben (ioctl), Commit (Feature, optional Output), Input lesen
     device.py     # Geräte-Logik: Snapshot lesen, Änderung anwenden (Backup→Write→Commit→Verify)
     validate.py   # Sicherheitsregeln für Änderungen
     monitor.py    # Hintergrund-Thread: Input-Reports → aktueller Zustand + Ringpuffer
@@ -131,8 +132,10 @@ Jede Einheit hat eine Aufgabe und lässt sich ohne Hardware testen. Die einzige 
   `HID_ID=0003:00000C70:0000F00D`.
 - Feature-Reports laufen über `fcntl.ioctl` (`HIDIOCGFEATURE` / `HIDIOCSFEATURE`). Lesen geschieht mit
   einem 1013-Byte-Puffer.
-- Output-Report `0x02` wird per `os.write` auf hidraw gesendet, wie TimSC/quadroctl es tut. Beim
-  Hardware-Test (§7) prüfen wir zusätzlich, ob die Änderung ohne Aquasuite wirksam wird; das ist der
+- Der Commit `0x02` wird wie im Kernel-Treiber (`aqc_send_ctrl_data`) als Feature-Report per `HIDIOCSFEATURE`
+  gesendet (`send_commit`). Der Konstruktor-Schalter `commit_as="output"` sendet ihn stattdessen per `os.write`
+  als Output-Report, wie TimSC/quadroctl es tut; damit lässt sich umschalten, falls der Hardware-Test es
+  verlangt. Beim Hardware-Test (§7) prüfen wir zusätzlich, ob die Änderung ohne Aquasuite wirksam wird; das ist der
   bekannte Bug bei Firmware 1033.
 - Input-Reports werden per blockierendem `os.read` mit Timeout (`select`) gelesen.
 - Ein Prozess-Lock serialisiert alle Steuer-Operationen, mit 200 ms Abstand zwischen ihnen, wie im
@@ -146,7 +149,7 @@ Jede Einheit hat eine Aufgabe und lässt sich ohne Hardware testen. Die einzige 
 3. `mutator(settings)` aufrufen, dann `validate.check(alt, neu)` (§4). Bei einem Verstoß abbrechen, ohne
    etwas zu schreiben.
 4. Mit `encode_settings` den neuen Report bauen. Wenn er identisch zum alten ist, nichts tun.
-5. Feature `0x03` schreiben, danach den Output-Report `0x02`.
+5. Feature `0x03` schreiben, danach den Commit `0x02` (als Feature-Report, siehe §3.2).
 6. Feature `0x03` erneut lesen und Byte für Byte mit dem Soll vergleichen. Erlaubt sind nur Abweichungen in
    Feldern, die das Gerät selbst pflegt; die Liste dieser Felder wird beim Hardware-Test ermittelt.
 7. Wenn der Vergleich fehlschlägt, das Backup zurückschreiben und den Fehler melden.
@@ -273,15 +276,19 @@ Zwei Dateien mit klar getrennten Zuständigkeiten:
 }
 ```
 
-Die Namen in `leds` kommen aus §5. Fehlt die Datei, legt `install.sh` sie mit den Werten oben an.
+Die Namen in `leds` kommen aus §5. Fehlt die Datei, legt `install.sh` sie mit den Standardwerten an. Die
+Beispielregeln im Zeitplan oben sind **nicht** vorinstalliert: der Standard-Zeitplan ist leer (`"schedule": []`),
+damit ein frisch installierter Dienst nie von sich aus auf das Gerät schreibt, bevor jemand Regeln anlegt.
 
 ## 4. Sicherheitsregeln (validate.py)
 
 - Kurven-Temperaturen streng aufsteigend, Bereich 0–100 °C.
 - Prozentwerte 0–100.
 - Lüfter mit `min_percent` (die Pumpe, 25 %): Das Geräte-Minimum (FanConfig `min`) darf nicht darunter
-  gesetzt werden. Ebenso wenig darf ein Fest-Wert darunter liegen. Kurvenpunkte darunter sind erlaubt, weil
-  das Geräte-Minimum sie nach oben begrenzt; die Oberfläche zeigt dafür einen Hinweis.
+  gesetzt werden. Ebenso wenig darf ein Fest-Wert darunter liegen. Kurvenpunkte sind frei wählbar:
+  Das Gerät bildet die Kurvenprozente linear auf Minimum–Maximum ab (0 % = Minimum, 100 % = Maximum; auf der
+  Hardware bestätigt: Kurve 4,31 % bei Min 28,02 % / Max 90,3 % ergibt 30,7 % Ausgang). Die Ausgabe liegt
+  damit immer im Bereich [Minimum, Maximum]. Die Oberfläche zeigt dafür einen Hinweis.
 - Min < Max, beides 0–100.
 - Zieltemperatur 20–60 °C.
 - Modus nur aus {Fest, Zieltemperatur, Kurve}. „Folgen“ (4) bleibt unverändert, wenn es schon gesetzt ist,
@@ -360,7 +367,7 @@ vor). Vorgehen:
 
 | Risiko | Gegenmaßnahme |
 | --- | --- |
-| Bug bei Firmware 1033: Schreibvorgänge werden ohne Aquasuite nicht wirksam (Issue #113) | Hardware-Test 2/3 deckt es früh auf. Fallback: Output-Report statt Feature-Report fürs Commit (wie TimSC), sonst Analyse per usbmon-Mitschnitt eines Aquasuite-Speichervorgangs. |
+| Bug bei Firmware 1033: Schreibvorgänge werden ohne Aquasuite nicht wirksam (Issue #113) | Hardware-Test 2/3 deckt es früh auf. Fallback: Output-Report statt Feature-Report fürs Commit (`commit_as="output"`, wie TimSC), sonst Analyse per usbmon-Mitschnitt eines Aquasuite-Speichervorgangs. |
 | Falsches Byte zerstört die Konfiguration | Nur bekannte Felder werden gepatcht, CRC-Prüfung, Backup vor jedem Schreiben, Vergleich mit Rollback, live gelesenes Profil vom 2026-10-04 als erstes Backup. |
 | Pumpe auf 0 % | `min_percent`-Regel, durchgesetzt im Server. |
 | Flash-Verschleiß | Schreiben nur auf Nutzeraktion oder Zeitplan-Wechsel (ca. 2/Tag), kein Schreiben ohne Änderung. |

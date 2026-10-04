@@ -10,6 +10,8 @@ temperatures (host hwmon sensors, values pushed from other machines) for referen
 
 - Python 3.11+ standard library only, no dependencies
 - Talks to the device via Linux `hidraw` (feature report 0x03 = settings, input report 0x01 = live data)
+- No schedule rules are installed by default, so a fresh install never writes to the device on its own; add rules in the UI
+- The commit report is sent as a HID feature report like the kernel driver (`commit_as="output"` on `HidrawTransport` switches to an output report)
 - Every write: fresh read → CRC check → backup → write → commit → read-back verify → rollback on mismatch
 
 > Protocol knowledge builds on [TimSC/quadroctl](https://github.com/TimSC/quadroctl) and the

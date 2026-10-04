@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -54,6 +55,18 @@ class BackupStoreTest(unittest.TestCase):
         with self.assertRaises(BackupError) as cm:
             self.store.load("broken.bin")
         self.assertIn("beschädigt", str(cm.exception))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read any file")
+    def test_load_maps_unreadable_file_to_backup_error(self):
+        path = Path(self.tmp.name, "locked.bin")
+        path.write_bytes(self.report)
+        path.chmod(0)
+        try:
+            with self.assertRaises(BackupError) as cm:
+                self.store.load("locked.bin")
+        finally:
+            path.chmod(0o600)
+        self.assertIn("nicht lesbar", str(cm.exception))
 
 
 if __name__ == "__main__":

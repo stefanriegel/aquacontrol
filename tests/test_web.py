@@ -139,13 +139,58 @@ class WebTest(unittest.TestCase):
                  {"time": "09:00", "target": "strip", "on": True, "brightness": 150}]
         status, body = self.req("PUT", "/api/schedule", {"rules": rules})
         self.assertEqual(status, 200)
-        self.assertEqual(body["desired"], {"on": True, "brightness": 150})
-        self.assertEqual(self.device.read_settings().strip_brightness, 150)  # applied immediately
+        # the manual brightness above is newer than the 09:00 rule, so it still wins
+        self.assertEqual(body["desired"], {"on": True, "brightness": 100})
+        self.assertEqual(self.device.read_settings().strip_brightness, 100)
+        self.now = datetime(2026, 10, 6, 9, 0)  # the next morning the rule applies again
+        self.scheduler.tick()
+        self.assertEqual(self.device.read_settings().strip_brightness, 150)
         status, body = self.req("POST", "/api/schedule/override", {"on": False})
         self.assertFalse(self.device.read_settings().strip_enabled)
         self.assertTrue(body["override_active"])
         status, _ = self.req("PUT", "/api/schedule", {"rules": [{"time": "7", "on": True}]})
         self.assertEqual(status, 400)
+
+    def test_manual_strip_off_survives_schedule_tick(self):
+        self.req("PUT", "/api/schedule", {"rules": [{"time": "09:00", "target": "strip", "on": True}]})
+        status, body = self.req("PUT", "/api/settings/strip", {"enabled": False})
+        self.assertEqual((status, body["changed"], body["backup"]), (200, True, None))
+        self.assertFalse(self.device.read_settings().strip_enabled)
+        writes = len(self.fake.writes)
+        self.now = datetime(2026, 10, 5, 12, 1)  # the 09:00 "on" rule is earlier today
+        self.scheduler.tick()
+        self.assertFalse(self.device.read_settings().strip_enabled)
+        self.assertEqual(len(self.fake.writes), writes)
+        status, body = self.req("PUT", "/api/settings/strip", {"enabled": False})  # nothing new to write
+        self.assertEqual((status, body["changed"]), (200, False))
+
+    def test_manual_strip_brightness_persists_across_tick(self):
+        self.req("PUT", "/api/schedule", {"rules": [{"time": "09:00", "target": "strip", "on": True,
+                                                     "brightness": 150}]})
+        self.assertEqual(self.device.read_settings().strip_brightness, 150)
+        status, body = self.req("PUT", "/api/settings/strip", {"brightness": 60})
+        self.assertEqual((status, body["changed"]), (200, True))
+        self.now = datetime(2026, 10, 5, 12, 1)
+        self.scheduler.tick()
+        s = self.device.read_settings()
+        self.assertEqual((s.strip_brightness, s.strip_enabled), (60, True))
+
+    def test_manual_strip_change_works_without_rules(self):
+        self.assertEqual(self.config.rules(), [])
+        status, body = self.req("PUT", "/api/settings/strip", {"enabled": False, "brightness": 77})
+        self.assertEqual((status, body["changed"]), (200, True))
+        s = self.device.read_settings()
+        self.assertEqual((s.strip_enabled, s.strip_brightness), (False, 77))
+        status, _ = self.req("PUT", "/api/settings/strip", {"brightness": 300})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.device.read_settings().strip_brightness, 77)
+
+    def test_unreadable_backup_is_400(self):
+        name = self.backups.save(load("settings_live.bin"), "x")
+        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError(13, "Permission denied")):
+            status, body = self.req("POST", f"/api/backups/{name}/restore", {})
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
 
     def test_backups_and_restore(self):
         original = load("settings_live.bin")

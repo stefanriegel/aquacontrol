@@ -17,10 +17,7 @@ DEFAULT_APP_CONFIG = {
     "sensors": {"1": "Wasser Temp"},
     "host_sensors": {"k10temp/Tctl": "CPU", "nvme/Composite": "NVMe"},
     "leds": {},
-    "schedule": [
-        {"time": "01:00", "target": "strip", "on": False},
-        {"time": "09:00", "target": "strip", "on": True},
-    ],
+    "schedule": [],  # no rules by default: a fresh install never writes to the device on its own
     "backup_dir": "/var/lib/aquacontrol/backups",
     "backup_keep": 50,
 }

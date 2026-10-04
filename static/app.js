@@ -242,7 +242,7 @@ function fanEditor(fan, sensorNames) {
   });
 
   const floorHint = fan.floor_percent != null
-    ? el("p", { class: "hint" }, `Minimum darf nicht unter ${fan.floor_percent} % liegen. Kurvenpunkte darunter werden vom Gerät auf das Minimum angehoben.`) : "";
+    ? el("p", { class: "hint" }, `Die Kurve wird vom Gerät linear auf Minimum–Maximum abgebildet: 0 % = Minimum, 100 % = Maximum. Das Minimum darf nicht unter ${fan.floor_percent} % liegen.`) : "";
   const card = el("div", { class: "card" },
     el("h3", {}, `${fan.index}: ${fan.name}`),
     el("div", { class: "fan-editor" },

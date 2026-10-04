@@ -130,10 +130,14 @@ class Device:
 
     def _write(self, report: bytes) -> None:
         self._t.set_feature(report)
-        self._t.write_output(COMMIT_REPORT)
+        self._t.send_commit(COMMIT_REPORT)
 
     def _verify(self, expected: bytes) -> None:
-        got = self._read_report()
+        try:
+            got = self._read_report()
+        except DeviceError as e:  # a transient read error must not cost a second flash write (rollback)
+            log.warning("read-back failed (%s), retrying once", e)
+            got = self._read_report()  # the transport paces this read like any other control operation
         diff = [i for i in range(SETTINGS_REPORT_LEN) if got[i] != expected[i] and i not in VOLATILE_OFFSETS]
         if diff:
             raise VerifyError(f"Gerät meldet abweichende Bytes an Offsets {diff[:12]}")
