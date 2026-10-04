@@ -18,6 +18,7 @@
   <button data-tab="fans">Lüfter</button>
   <button data-tab="leds">LEDs</button>
   <button data-tab="schedule">Zeitplan</button>
+  <button data-tab="climate">Klima</button>
   <button data-tab="backups">Backups</button>
 </nav>
 <main>
@@ -46,6 +47,23 @@
     <table id="rules"><thead><tr><th>Uhrzeit</th><th>Tage</th><th>Aktion</th><th>Helligkeit</th><th></th></tr></thead><tbody></tbody></table>
     <button id="rule-add">Regel hinzufügen</button>
     <button id="rules-save">Zeitplan speichern</button> <span class="msg" id="rules-msg"></span>
+  </section>
+  <section id="tab-climate" hidden>
+    <p class="hint">Schaltet die Klimaanlage über Home Assistant ein, wenn die Wasserkühlung dauerhaft am Limit läuft, und wieder aus, wenn das Wasser deutlich kühler ist. Handbetrieb hat immer Vorrang.</p>
+    <div class="card" id="climate-status"></div>
+    <div class="card">
+      <h3>Einstellungen</h3>
+      <div class="fields" id="climate-form"></div>
+      <div class="strip-actions">
+        <button id="climate-save" class="primary">Speichern</button>
+        <button id="climate-test">Verbindung testen</button>
+        <span class="msg" id="climate-msg"></span>
+      </div>
+      <p class="hint">„Verbindung testen“ liest die gespeicherten Werte aus Home Assistant und schaltet nichts. Zuerst speichern.</p>
+      <div class="msg" id="climate-test-result"></div>
+    </div>
+    <h2>Ereignisse</h2>
+    <table id="climate-events"><thead><tr><th>Zeit</th><th>Ereignis</th></tr></thead><tbody></tbody></table>
   </section>
   <section id="tab-backups" hidden>
     <p class="hint">Vor jeder Änderung wird das Geräteprofil gesichert. „pinned“-Backups werden nie automatisch gelöscht.</p>
