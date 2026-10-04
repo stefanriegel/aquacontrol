@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs in VM 103: send GPU temperatures/power/utilisation to aquacontrol (display only).
+# Runs on the machine with the GPUs (e.g. a VM with GPU passthrough): send GPU temperature/power/load to aquacontrol (display only).
 # AQUACONTROL_URL, AQUACONTROL_TOKEN and AQUACONTROL_CA come from the unit's EnvironmentFile.
 set -euo pipefail
 sensors=$(nvidia-smi --query-gpu=index,temperature.gpu,power.draw,utilization.gpu \
