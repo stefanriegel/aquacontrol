@@ -21,6 +21,7 @@ from typing import Callable
 from . import protocol as p
 from .auth import token_source, verify_password
 from .backups import BackupError, BackupStore
+from .colors import hex_to_hsv1536, hsv1536_to_hex
 from .climate import (FAN_MODES, HORIZONTAL, HVAC_MODES, PRESETS, VERTICAL, ClimateConfigError, ClimateController,
                       _entity as parse_entity)
 from .config import AppConfig, Secrets
@@ -45,6 +46,10 @@ FAIL_LIMIT = 10             # failed logins per FAIL_WINDOW_S before further att
 FAIL_WINDOW_S = 60.0
 MAX_CONNECTIONS = 32
 MODES_BY_NAME = {"fixed": p.MODE_FIXED, "target": p.MODE_TARGET, "curve": p.MODE_CURVE}
+LED_MODE_NAMES = {p.LED_MODE_UNUSED: "unbenutzt", p.LED_MODE_STATIC: "statisch", p.LED_MODE_COLOR_SWITCH: "farbschalter"}
+LED_EDITABLE_MODES = (p.LED_MODE_STATIC, p.LED_MODE_COLOR_SWITCH)
+LED_FLAG_FIELDS = {"fade": p.LED_FLAG_FADE, "blink": p.LED_FLAG_BLINK, "brightness_by_source": p.LED_FLAG_BRIGHTNESS}
+LED_BODY_KEYS = {"thresholds", "colors", "source", *LED_FLAG_FIELDS}
 
 
 class BadRequest(ValueError):
@@ -76,6 +81,50 @@ def _number(body: dict, key: str) -> float | None:
     if not math.isfinite(f):
         raise BadRequest(f"{key} muss eine Zahl sein")
     return f
+
+
+def _source_name(source: int, sensors: list[str]) -> str:
+    """Display name of an LED data source index (see docs/led-layout.md)."""
+    if 0 <= source < len(sensors):
+        return sensors[source]
+    if source == 4:
+        return "Durchfluss"
+    if 5 <= source < 5 + p.NUM_SOFT_SENSORS:
+        return f"Software-Sensor {source - 4}"
+    return "keine" if source == p.LED_SOURCE_NONE else f"Quelle {source}"
+
+
+def _led_body(body: dict) -> dict:
+    """Parse and type-check the body of PUT /api/settings/led/N (ranges are checked by validate.py)."""
+    unknown = sorted(set(body) - LED_BODY_KEYS)
+    if unknown:
+        raise BadRequest(f"unbekanntes Feld: {', '.join(unknown)}")
+    out: dict = {}
+    for key in LED_FLAG_FIELDS:
+        if key in body:
+            if not isinstance(body[key], bool):
+                raise BadRequest(f"{key} muss true oder false sein")
+            out[key] = body[key]
+    if "source" in body:
+        if isinstance(body["source"], bool) or not isinstance(body["source"], int):
+            raise BadRequest("source muss eine Ganzzahl sein")
+        out["source"] = body["source"]
+    if "thresholds" in body:
+        t = body["thresholds"]
+        if not isinstance(t, list) or not all(isinstance(v, int) and not isinstance(v, bool) for v in t):
+            raise BadRequest("thresholds muss eine Liste ganzer Zahlen sein")
+        if not 1 <= len(t) <= p.LED_MAX_THRESHOLDS:
+            raise BadRequest(f"thresholds braucht 1 bis {p.LED_MAX_THRESHOLDS} Schwellen")
+        out["thresholds"] = tuple(t)
+    if "colors" in body:
+        c = body["colors"]
+        if not isinstance(c, list) or not 1 <= len(c) <= p.LED_PALETTE:
+            raise BadRequest(f"colors muss 1 bis {p.LED_PALETTE} Farben als \"#rrggbb\" enthalten")
+        try:
+            out["colors"] = tuple((color, hex_to_hsv1536(color)) for color in c)
+        except ValueError as e:
+            raise BadRequest(str(e)) from None
+    return out
 
 
 class App:
@@ -184,10 +233,17 @@ class App:
                 "pid": list(c.pid),
                 "floor_percent": self.config.min_percent().get(i),
             })
-        leds = [{"index": i + 1, "name": self.config.led_name(i, names.leds[i] if names else f"LED {i + 1}"),
-                 "led_start": led.led_start, "led_count": led.led_count, "mode": led.mode}
-                for i, led in enumerate(s.leds)]
         sensors = [self.config.sensor_name(i, names.temps[i] if names else f"Sensor {i + 1}") for i in range(4)]
+        leds = [{"index": i + 1, "name": self.config.led_name(i, names.leds[i] if names else f"LED {i + 1}"),
+                 "led_start": led.led_start, "led_count": led.led_count, "mode": led.mode,
+                 "mode_name": LED_MODE_NAMES.get(led.mode, f"raw-{led.mode}"),
+                 "editable": led.mode in LED_EDITABLE_MODES,
+                 "source": led.source, "source_name": _source_name(led.source, sensors),
+                 "range": [led.binding1[0], led.binding1[1]],
+                 "thresholds": list(led.thresholds),
+                 "colors": [hsv1536_to_hex(*c) for c in led.colors],
+                 "flags": {name: bool(led.flags & bit) for name, bit in LED_FLAG_FIELDS.items()}}
+                for i, led in enumerate(s.leds)]
         return {"fans": fans, "leds": leds, "sensors": sensors,
                 "strip": {"enabled": s.strip_enabled, "brightness": s.strip_brightness}}
 
@@ -243,6 +299,44 @@ class App:
             return s
 
         result = self.device.apply(mutate, reason=f"kanal-{index}")
+        return {"ok": True, "changed": result.changed, "backup": result.backup}
+
+    def update_led(self, index: int, body: dict) -> dict:
+        if not 1 <= index <= p.NUM_LEDS:
+            raise BadRequest("LED-Controller muss 1–8 sein")
+        i = index - 1
+        req = _led_body(body)
+
+        def mutate(s: p.Settings) -> p.Settings:
+            led = s.leds[i]
+            if led.mode not in LED_EDITABLE_MODES:
+                if req:
+                    raise BadRequest(f"LED-Controller {index} ist nicht änderbar")
+                return s
+            if led.mode == p.LED_MODE_STATIC and ("thresholds" in req or "source" in req):
+                raise BadRequest("eine statische Farbe hat weder Schwellen noch Datenquelle")
+            if "thresholds" in req:
+                s = p.with_led(s, i, thresholds=req["thresholds"])
+            led = s.leds[i]
+            if "colors" in req:
+                expected = len(led.colors)
+                if len(req["colors"]) != expected:
+                    raise BadRequest(f"colors braucht genau {expected} Farben (eine mehr als Schwellen)")
+                # A colour that is the hex form of what the device holds stays as it is: converting it
+                # back would round the hue (aquasuite's green is 511, "#00ff00" is 512).
+                keep = tuple(old if hsv1536_to_hex(*old) == color.lower() else new
+                             for (color, new), old in zip(req["colors"], led.palette))
+                s = p.with_led(s, i, colors=keep)
+            flags = led.flags
+            for name, bit in LED_FLAG_FIELDS.items():
+                if name in req:
+                    flags = flags | bit if req[name] else flags & ~bit
+            changes = {"flags": flags}
+            if "source" in req:
+                changes["source"] = req["source"]
+            return p.with_led(s, i, **changes)
+
+        result = self.device.apply(mutate, reason=f"led-{index}")
         return {"ok": True, "changed": result.changed, "backup": result.backup}
 
     def update_strip(self, body: dict) -> dict:
@@ -507,6 +601,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 m = re.fullmatch(r"/api/settings/fan/(\d)", path)
                 if method == "PUT" and m:
                     return self._send(200, app.update_fan(int(m.group(1)), body))
+                m = re.fullmatch(r"/api/settings/led/(\d)", path)
+                if method == "PUT" and m:
+                    return self._send(200, app.update_led(int(m.group(1)), body))
                 if method == "PUT" and path == "/api/settings/strip":
                     return self._send(200, app.update_strip(body))
                 if method == "PUT" and path == "/api/schedule":

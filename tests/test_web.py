@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+from aquacontrol import protocol as p
 from aquacontrol.auth import hash_password, hash_token
 from aquacontrol.backups import BackupStore
 from aquacontrol.climate import DEFAULT_CLIMATE, ClimateController
@@ -99,6 +100,128 @@ class WebTest(unittest.TestCase):
         self.assertEqual(body["fans"][0]["floor_percent"], 25.0)
         self.assertEqual(body["strip"], {"enabled": True, "brightness": 218})
         self.assertEqual(body["sensors"][0], "Wasser Temp")
+
+    def test_settings_leds(self):
+        _, body = self.req("GET", "/api/settings")
+        leds = body["leds"]
+        self.assertEqual(len(leds), 8)
+        c1 = leds[0]
+        self.assertEqual((c1["index"], c1["name"], c1["led_start"], c1["led_count"], c1["mode"]),
+                         (1, "LED Controller 1", 0, 30, 0x12))
+        self.assertEqual((c1["mode_name"], c1["editable"], c1["source"], c1["source_name"]),
+                         ("farbschalter", True, 0, "Wasser Temp"))
+        self.assertEqual((c1["range"], c1["thresholds"]), ([20, 70], [35, 45]))
+        self.assertEqual(c1["colors"], ["#01ff00", "#fffe00", "#ff0000"])  # h=511/255/0, s=v=255
+        self.assertEqual(c1["flags"], {"fade": False, "blink": False, "brightness_by_source": False})
+        c2 = leds[1]
+        self.assertEqual((c2["mode_name"], c2["editable"], c2["thresholds"], c2["colors"], c2["source"]),
+                         ("statisch", True, [], ["#01ff00"], -1))
+        self.assertEqual(c2["source_name"], "keine")
+        for led in leds[2:]:
+            self.assertEqual((led["mode_name"], led["editable"], led["colors"], led["thresholds"]),
+                             ("unbenutzt", False, [], []))
+        self.assertEqual(leds[6]["flags"], {"fade": False, "blink": True, "brightness_by_source": False})
+
+    def test_settings_leds_other_modes_and_sources(self):
+        r = bytearray(load("settings_live.bin"))
+        r[397 + 70 * 4 + 3] = 0x20  # C5: a mode we do not know
+        r[397 + 6:397 + 8] = (4).to_bytes(2, "big")  # C1 on the flow sensor
+        r[959:961] = p.crc16_usb(bytes(r[1:959])).to_bytes(2, "big")
+        self.fake.settings = bytes(r)
+        _, body = self.req("GET", "/api/settings")
+        self.assertEqual((body["leds"][4]["mode_name"], body["leds"][4]["editable"]), ("raw-32", False))
+        self.assertEqual((body["leds"][0]["source"], body["leds"][0]["source_name"]), (4, "Durchfluss"))
+
+    def test_update_led_thresholds_colours_and_flags(self):
+        status, body = self.req("PUT", "/api/settings/led/1", {
+            "thresholds": [38, 48], "colors": ["#0000ff", "#fffe00", "#ff0000"], "fade": True, "blink": False,
+            "brightness_by_source": True, "source": 1})
+        self.assertEqual((status, body["changed"]), (200, True))
+        self.assertTrue(body["backup"].endswith(".bin"))
+        led = self.device.read_settings().leds[0]
+        self.assertEqual(led.thresholds, (38, 48))
+        self.assertEqual(led.colors, ((1024, 255, 255), (255, 255, 255), (0, 255, 255)))  # untouched ones keep their hue
+        self.assertEqual((led.flags, led.source), (0x4001, 1))
+        _, settings = self.req("GET", "/api/settings")
+        self.assertEqual(settings["leds"][0]["colors"][0], "#0000ff")
+        self.assertEqual(self.backups.load(body["backup"]), load("settings_live.bin"))
+
+    def test_update_led_unchanged_colours_keep_the_exact_device_hue(self):
+        status, body = self.req("PUT", "/api/settings/led/1", {"colors": ["#01ff00", "#fffe00", "#ff0000"]})
+        self.assertEqual((status, body["changed"], self.fake.writes), (200, False, []))  # h=511 stays 511
+
+    def test_update_led_add_and_remove_threshold(self):
+        self.req("PUT", "/api/settings/led/1", {"thresholds": [30, 40, 50], "colors": ["#01ff00", "#fffe00", "#ff0000", "#0000ff"]})
+        led = self.device.read_settings().leds[0]
+        self.assertEqual((led.thresholds, len(led.colors), led.colors[3]), ((30, 40, 50), 4, (1024, 255, 255)))
+        self.req("PUT", "/api/settings/led/1", {"thresholds": [40]})
+        led = self.device.read_settings().leds[0]
+        self.assertEqual((led.thresholds, led.values[3]), ((40,), 0))
+
+    def test_update_led_adding_a_threshold_without_colours_copies_the_last_colour(self):
+        self.req("PUT", "/api/settings/led/1", {"thresholds": [30, 40, 50]})
+        self.assertEqual(self.device.read_settings().leds[0].colors[3], (0, 255, 255))
+
+    def test_update_static_led(self):
+        status, body = self.req("PUT", "/api/settings/led/2", {"colors": ["#ff0000"], "blink": True})
+        self.assertEqual((status, body["changed"]), (200, True))
+        led = self.device.read_settings().leds[1]
+        self.assertEqual((led.colors, led.flags), (((0, 255, 255),), 0x0002))
+
+    def test_update_led_invalid_input_is_400(self):
+        cases = [
+            (1, {"thresholds": [45, 35]}),               # not increasing
+            (1, {"thresholds": [10, 45]}),               # outside 20-70
+            (1, {"thresholds": [35.5, 45]}),
+            (1, {"thresholds": ["35", 45]}),
+            (1, {"thresholds": 35}),
+            (1, {"thresholds": []}),
+            (1, {"thresholds": [21, 22, 23, 24, 25, 26]}),
+            (1, {"thresholds": list(range(21, 41))}),
+            (1, {"colors": ["#00ff00"]}),                # needs 3
+            (1, {"colors": ["#00ff00", "red", "#ff0000"]}),
+            (1, {"colors": ["#00ff00", "#ffff0", "#ff0000"]}),
+            (1, {"colors": ["#00ff00", 5, "#ff0000"]}),
+            (1, {"colors": "#00ff00"}),
+            (1, {"thresholds": [30, 40], "colors": ["#00ff00", "#ff0000"]}),
+            (1, {"fade": "yes"}),
+            (1, {"blink": 1}),
+            (1, {"brightness_by_source": None}),
+            (1, {"source": 4}),                          # flow
+            (1, {"source": "1"}),
+            (1, {"source": True}),
+            (1, {"source": 1.5}),
+            (1, {"mode": 1}),                            # unknown field
+            (1, {"led_count": 5}),
+            (2, {"thresholds": [30]}),                   # static colour has none
+            (2, {"source": 1}),
+            (2, {"colors": ["#ff0000", "#00ff00"]}),
+            (3, {"fade": True}),                         # unused
+            (3, {"colors": ["#ff0000"]}),
+            (9, {"fade": True}),
+            (0, {"fade": True}),
+        ]
+        for n, body in cases:
+            with self.subTest(n=n, body=body):
+                status, resp = self.req("PUT", f"/api/settings/led/{n}", body)
+                self.assertEqual(status, 400, resp)
+                self.assertIn("error", resp)
+        status, _ = self.req("PUT", "/api/settings/led/1", [1])
+        self.assertEqual(status, 400)
+        status, _ = self.req("PUT", "/api/settings/led/10", {"fade": True})
+        self.assertEqual(status, 404)  # not a led route at all
+        self.assertEqual(self.fake.writes, [])
+
+    def test_update_led_empty_body_changes_nothing(self):
+        status, body = self.req("PUT", "/api/settings/led/1", {})
+        self.assertEqual((status, body["changed"]), (200, False))
+
+    def test_update_led_requires_auth_and_device(self):
+        status, _ = self.req("PUT", "/api/settings/led/1", {"fade": True}, auth=False)
+        self.assertEqual(status, 401)
+        self.fake.present = False
+        status, _ = self.req("PUT", "/api/settings/led/1", {"fade": True})
+        self.assertEqual(status, 502)
 
     def test_update_fan_target(self):
         status, body = self.req("PUT", "/api/settings/fan/4", {"target_c": 38.0})
