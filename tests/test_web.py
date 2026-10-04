@@ -139,10 +139,10 @@ class WebTest(unittest.TestCase):
                  {"time": "09:00", "target": "strip", "on": True, "brightness": 150}]
         status, body = self.req("PUT", "/api/schedule", {"rules": rules})
         self.assertEqual(status, 200)
-        # the manual brightness above is newer than the 09:00 rule, so it still wins
-        self.assertEqual(body["desired"], {"on": True, "brightness": 100})
-        self.assertEqual(self.device.read_settings().strip_brightness, 100)
-        self.now = datetime(2026, 10, 6, 9, 0)  # the next morning the rule applies again
+        # saving the schedule drops the manual override, so the 09:00 rule applies right away
+        self.assertEqual(body["desired"], {"on": True, "brightness": 150})
+        self.assertEqual(self.device.read_settings().strip_brightness, 150)
+        self.now = datetime(2026, 10, 6, 9, 0)  # the next morning the rule still applies
         self.scheduler.tick()
         self.assertEqual(self.device.read_settings().strip_brightness, 150)
         status, body = self.req("POST", "/api/schedule/override", {"on": False})
@@ -150,6 +150,23 @@ class WebTest(unittest.TestCase):
         self.assertTrue(body["override_active"])
         status, _ = self.req("PUT", "/api/schedule", {"rules": [{"time": "7", "on": True}]})
         self.assertEqual(status, 400)
+
+    def test_saving_schedule_clears_override_and_applies_rules_now(self):
+        self.req("PUT", "/api/settings/strip", {"enabled": False})  # manual override, newer than any rule
+        self.assertFalse(self.device.read_settings().strip_enabled)
+        rules = [{"time": "01:00", "target": "strip", "on": False},
+                 {"time": "09:00", "target": "strip", "on": True}]
+        status, body = self.req("PUT", "/api/schedule", {"rules": rules})
+        self.assertEqual(status, 200)
+        self.assertTrue(self.device.read_settings().strip_enabled)
+        self.assertFalse(body["override_active"])
+        self.assertEqual(body["desired"], {"on": True, "brightness": None})
+
+    def test_rejected_schedule_keeps_override(self):
+        self.req("PUT", "/api/settings/strip", {"enabled": False})
+        status, _ = self.req("PUT", "/api/schedule", {"rules": [{"time": "7", "on": True}]})
+        self.assertEqual(status, 400)
+        self.assertTrue(self.scheduler.status()["override_active"])
 
     def test_manual_strip_off_survives_schedule_tick(self):
         self.req("PUT", "/api/schedule", {"rules": [{"time": "09:00", "target": "strip", "on": True}]})

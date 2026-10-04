@@ -133,6 +133,12 @@ class Scheduler:
             self._override = Override(StripState(on, brightness), self._clock())
             self._failures, self._retry_at = 0, None  # a manual change is tried right away
 
+    def clear_override(self) -> None:
+        """Drop a manual override so the rules apply again at the next tick."""
+        with self._lock:
+            self._override = None
+            self._failures, self._retry_at = 0, None
+
     def tick(self):
         """Apply the desired state. tick() itself keeps the write backoff (so it is testable via the
         injected clock): while backing off it returns None and leaves last_error untouched."""

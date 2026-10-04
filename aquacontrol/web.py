@@ -239,6 +239,7 @@ class App:
 
     def put_schedule(self, body: dict) -> dict:
         self.config.set_rules(body.get("rules"))
+        self.scheduler.clear_override()  # saved rules take effect now, a manual change must not shadow them
         self.scheduler.tick()
         return self.schedule_json()
 

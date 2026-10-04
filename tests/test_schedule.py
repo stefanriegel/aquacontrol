@@ -112,6 +112,19 @@ class SchedulerTest(unittest.TestCase):
         self.assertTrue(self.dev.read_settings().strip_enabled)
         self.assertTrue(self.sched.status()["override_active"])
 
+    def test_clear_override_returns_to_rules_and_resets_backoff(self):
+        self.now = at(5, 12, 0)
+        self.sched.set_override(False)
+        self.sched.tick()
+        self.assertFalse(self.dev.read_settings().strip_enabled)
+        self.sched.clear_override()
+        self.assertFalse(self.sched.status()["override_active"])
+        self.sched.tick()  # the 09:00 rule says "on"
+        self.assertTrue(self.dev.read_settings().strip_enabled)
+        self.sched._failures, self.sched._retry_at = 2, self.now + timedelta(hours=1)
+        self.sched.clear_override()
+        self.assertEqual((self.sched._failures, self.sched._retry_at), (0, None))
+
     def test_no_rules_no_writes(self):
         sched = Scheduler(self.dev, lambda: [], clock=lambda: self.now)
         self.assertIsNone(sched.tick())
