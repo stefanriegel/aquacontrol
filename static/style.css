@@ -70,7 +70,8 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-
 .fields h4 { margin: 14px 0 2px; font-size: 14px; color: var(--muted); }
 .fields label { flex-wrap: wrap; }
 .fields input[type=text], .fields input[type=password] { width: 420px; max-width: 100%; }
-.fields .channels { display: inline-flex; gap: 10px; }
+.fields select.wide { width: 420px; max-width: 100%; }
+.fields .channels { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; }
 .fields .channels label { margin: 0; }
 .climate-state { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .climate-lines { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }

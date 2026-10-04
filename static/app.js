@@ -446,20 +446,21 @@ $("#rules-save").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------- climate
-const HVAC_OPTIONS = [["cool", "Kühlen (cool)"], ["dry", "Entfeuchten (dry)"], ["fan_only", "Nur Lüfter (fan_only)"]];
-const same = (list) => list.map((v) => [v, v]);
+const HVAC_LABELS = { cool: "Kühlen (cool)", dry: "Entfeuchten (dry)", fan_only: "Nur Lüfter (fan_only)" };
+// Everything with a fixed set of valid values is a drop-down filled from GET /api/climate/options (`list` names
+// the key of that response). Only the address, numbers and the token are typed.
 const CLIMATE_FIELDS = [
   { group: "Home Assistant" },
   { path: "enabled", label: "Klima-Automatik aktiviert", kind: "bool" },
   { path: "ha_url", label: "Adresse", kind: "text", placeholder: "http://homeassistant.local:8123" },
   { kind: "token", label: "Zugangs-Token" },
-  { path: "entity_id", label: "Klimaanlage (Entity)", kind: "text" },
-  { path: "horizontal_select", label: "Lamellen horizontal (Select)", kind: "text" },
-  { path: "vertical_select", label: "Lamellen vertikal (Select)", kind: "text" },
+  { path: "entity_id", label: "Klimaanlage (Entity)", kind: "select", list: "climate_entities", wide: true, reload: true },
+  { path: "horizontal_select", label: "Lamellen horizontal (Select)", kind: "select", list: "select_entities", wide: true, reload: true },
+  { path: "vertical_select", label: "Lamellen vertikal (Select)", kind: "select", list: "select_entities", wide: true, reload: true },
   { group: "Einschalten, wenn alles ununterbrochen gilt" },
   { path: "on.water_c", label: "Wasser mindestens °C", kind: "number", min: 0, max: 100, step: 0.5 },
   { path: "on.fan_percent", label: "Lüfter mindestens %", kind: "number", min: 0, max: 100, step: 1 },
-  { path: "on.fan_channels", label: "Lüfterkanäle (alle)", kind: "channels" },
+  { path: "on.fan_channels", label: "Lüfter (alle gewählten)", kind: "channels" },
   { path: "on.minutes", label: "für Minuten", kind: "number", min: 1, max: 240, step: 1 },
   { group: "Ausschalten, wenn alles ununterbrochen gilt" },
   { path: "off.water_c", label: "Wasser höchstens °C", kind: "number", min: 0, max: 100, step: 0.5 },
@@ -468,18 +469,51 @@ const CLIMATE_FIELDS = [
   { path: "min_on_minutes", label: "Mindestlaufzeit (Min.)", kind: "number", min: 1, max: 240, step: 1 },
   { path: "min_off_minutes", label: "Sperrzeit nach Ausschalten (Min.)", kind: "number", min: 1, max: 240, step: 1 },
   { path: "max_switches_per_hour", label: "Höchstens Schaltvorgänge pro Stunde (nur Einschalten)", kind: "number", min: 1, max: 20, step: 1 },
+  { path: "manual_off_pause_minutes", label: "Pause nach Ausschalten von Hand (Min., höchstens)", kind: "number", min: 10, max: 480, step: 1 },
   { group: "Klimaanlage beim Einschalten" },
-  { path: "ac.hvac_mode", label: "Betriebsart", kind: "select", options: HVAC_OPTIONS },
+  { path: "ac.hvac_mode", label: "Betriebsart", kind: "select", list: "hvac_modes", labels: HVAC_LABELS },
   { path: "ac.temperature", label: "Solltemperatur °C", kind: "number", min: 16, max: 30, step: 0.5 },
-  { path: "ac.preset", label: "Preset", kind: "select", options: same(["Normal", "Quiet", "Powerful"]) },
-  { path: "ac.fan_mode", label: "Lüfterstufe", kind: "select", options: same(["Automatic", "1", "2", "3", "4", "5"]) },
-  { path: "ac.horizontal", label: "Lamellen horizontal", kind: "select",
-    options: same(["auto", "left", "left_center", "center", "right_center", "right"]) },
-  { path: "ac.vertical", label: "Lamellen vertikal", kind: "select",
-    options: same(["swing", "auto", "up", "up_center", "center", "down_center", "down"]) },
+  { path: "ac.preset", label: "Preset", kind: "select", list: "preset_modes" },
+  { path: "ac.fan_mode", label: "Lüfterstufe", kind: "select", list: "fan_modes" },
+  { path: "ac.horizontal", label: "Lamellen horizontal", kind: "select", list: "horizontal" },
+  { path: "ac.vertical", label: "Lamellen vertikal", kind: "select", list: "vertical" },
 ];
 const STATE_TEXT = { idle: "Bereit", arming: "Einschalt-Bedingung läuft", owned: "Von aquacontrol eingeschaltet",
-  cooldown: "Sperrzeit", disabled: "Deaktiviert" };
+  cooldown: "Pause / Sperrzeit", disabled: "Deaktiviert" };
+
+// [value, label] pairs for a drop-down. The saved value stays selectable even if the list lacks it (marked).
+function choiceOptions(list, saved, labels = {}) {
+  const items = [...new Set(list)].map((v) => [v, labels[v] || v]);
+  if (saved !== null && saved !== undefined && saved !== "" && !list.includes(saved)) items.unshift([saved, `${labels[saved] || saved} (gespeichert)`]);
+  return items;
+}
+
+function fanChannelLabel(index, names) {
+  const name = names && names[index];
+  return name ? `${index + 1}: ${name}` : String(index + 1);
+}
+
+function climateOptionsNote(opts) {
+  if (!opts) return "Die Auswahllisten konnten nicht geladen werden.";
+  if (opts.source === "ha") return "Die Auswahl kommt aus Home Assistant." + (opts.error ? ` ${opts.error}` : "");
+  return `Eingebaute Auswahl${opts.error ? `, weil Home Assistant nicht gelesen werden konnte: ${opts.error}` : ""}`;
+}
+
+function climateSavedText(res) {
+  return res.notice ? `Gespeichert. ${res.notice}` : "Gespeichert.";
+}
+
+// Two-step button for dangerous actions: the first click arms it, a second click within `ms` runs `action`.
+function armedClick(btn, armedText, action, ms = 5000, timers = { set: setTimeout, clear: clearTimeout }) {
+  const idleText = btn.textContent, idleClass = btn.className;
+  let timer = null;
+  const disarm = () => { timers.clear(timer); timer = null; btn.textContent = idleText; btn.className = idleClass; };
+  btn.addEventListener("click", () => {
+    if (timer === null) { btn.textContent = armedText; btn.className = "danger"; timer = timers.set(disarm, ms); return; }
+    disarm();
+    action();
+  });
+}
 
 // Request body for PUT /api/climate: a nested object built from the flat field values. Empty numbers become null
 // (the server rejects them with a message) instead of silently turning into 0. The token is sent only if typed.
@@ -520,6 +554,11 @@ function climateTimers(st, now) {
   if (st.owned_since !== null && st.owned_since !== undefined) lines.push(`Läuft seit ${fmtDuration(now - st.owned_since)}`);
   if (st.off_condition_since !== null && st.off_condition_since !== undefined) lines.push(`Ausschalt-Bedingung erfüllt seit ${fmtDuration(now - st.off_condition_since)}`);
   if (st.cooldown_until !== null && st.cooldown_until !== undefined && st.cooldown_until > now) lines.push(`Sperrzeit noch ${fmtDuration(st.cooldown_until - now)}`);
+  if (st.manual_off_until !== null && st.manual_off_until !== undefined) {
+    const until = new Date(st.manual_off_until * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+    lines.push(`Von Hand ausgeschaltet: Automatik pausiert bis das Wasser wieder kühl ist, spätestens ${until}`);
+  }
+  if (st.unconfirmed) lines.push("Einschalten unbestätigt: Home Assistant zeigt die eingestellten Werte noch nicht");
   lines.push(`Eigene Schaltvorgänge in der letzten Stunde: ${st.switches_last_hour ?? 0}`);
   if (st.last_error) lines.push(`Letzter Fehler: ${st.last_error}`);
   return lines;
@@ -531,9 +570,10 @@ function climateTestText(res) {
     + `Lamellen horizontal ${v(res.horizontal)} / vertikal ${v(res.vertical)}`;
 }
 
-const climateInputs = {};  // field path -> { read(), write(value) }
+const climateInputs = {};  // field path -> { read(), write(value), refill() }
 let climateTokenInput = null;
 let climateFormBuilt = false;
+let climateOptions = null;  // last answer of GET /api/climate/options
 
 function buildClimateForm() {
   const form = $("#climate-form");
@@ -543,11 +583,7 @@ function buildClimateForm() {
     if (f.kind === "token") {
       climateTokenInput = el("input", { type: "password", autocomplete: "new-password", "aria-label": f.label });
       const clear = el("button", { type: "button", class: "danger", id: "climate-token-clear", hidden: true }, "Token löschen");
-      let armed = false;
-      clear.addEventListener("click", async () => {
-        if (!armed) { armed = true; clear.textContent = "Wirklich löschen?"; return; }
-        armed = false;
-        clear.textContent = "Token löschen";
+      armedClick(clear, "Wirklich löschen?", async () => {
         try { renderClimate(await api("PUT", "/api/climate", { token: "" })); showMsg($("#climate-msg"), "Token gelöscht.", true); }
         catch (e) { showMsg($("#climate-msg"), e.message, false); }
       });
@@ -559,14 +595,23 @@ function buildClimateForm() {
       input = el("input", { type: "checkbox" });
       climateInputs[f.path] = { read: () => input.checked, write: (v) => { input.checked = Boolean(v); } };
     } else if (f.kind === "select") {
-      input = el("select", {}, ...f.options.map(([v, t]) => el("option", { value: v }, t)));
-      climateInputs[f.path] = { read: () => input.value, write: (v) => { input.value = String(v); } };
+      input = el("select", { class: f.wide ? "wide" : null });
+      let saved = null;
+      const fill = () => {
+        const current = input.value;
+        input.replaceChildren(...choiceOptions((climateOptions && climateOptions[f.list]) || [], saved, f.labels).map(([v, t]) => el("option", { value: v }, t)));
+        if ([...input.options].some((o) => o.value === current)) input.value = current;
+      };
+      climateInputs[f.path] = { read: () => input.value, write: (v) => { saved = v; fill(); input.value = String(v); }, refill: fill };
+      if (f.reload) input.addEventListener("change", reloadClimateOptions);
     } else if (f.kind === "channels") {
       const boxes = [1, 2, 3, 4].map((n) => el("input", { type: "checkbox", value: n }));
-      input = el("span", { class: "channels" }, ...boxes.map((b, i) => el("label", {}, b, String(i + 1))));
+      const texts = boxes.map((_, i) => el("span", {}, fanChannelLabel(i, null)));
+      input = el("span", { class: "channels" }, ...boxes.map((b, i) => el("label", {}, b, texts[i])));
       climateInputs[f.path] = {
         read: () => boxes.filter((b) => b.checked).map((b) => Number(b.value)),
         write: (v) => boxes.forEach((b) => { b.checked = (v || []).includes(Number(b.value)); }),
+        names: (names) => texts.forEach((t, i) => { t.textContent = fanChannelLabel(i, names); }),
       };
     } else {
       const attrs = f.kind === "number" ? { type: "number", min: f.min, max: f.max, step: f.step } : { type: "text", placeholder: f.placeholder || null, autocomplete: "off", spellcheck: "false" };
@@ -578,11 +623,28 @@ function buildClimateForm() {
   climateFormBuilt = true;
 }
 
+// Fetch the choices again (for the entities currently picked in the form) and refill every drop-down.
+async function reloadClimateOptions() {
+  const params = new URLSearchParams();
+  for (const key of ["entity_id", "horizontal_select", "vertical_select"]) {
+    if (climateFormBuilt && climateInputs[key] && climateInputs[key].read()) params.set(key, climateInputs[key].read());
+  }
+  try {
+    climateOptions = await api("GET", `/api/climate/options?${params}`);
+  } catch (e) {
+    climateOptions = null;
+  }
+  for (const io of Object.values(climateInputs)) if (io.refill) io.refill();
+  $("#climate-options-note").textContent = climateOptionsNote(climateOptions);
+}
+
 function renderClimate(data) {
   if (!climateFormBuilt) buildClimateForm();
   for (const f of CLIMATE_FIELDS) {
     if (f.path) climateInputs[f.path].write(f.path.split(".").reduce((o, k) => o[k], data.config));
   }
+  climateInputs["on.fan_channels"].names(lastStatus ? lastStatus.fan_names : null);
+  $("#climate-options-note").textContent = climateOptionsNote(climateOptions);
   climateTokenInput.value = "";
   climateTokenInput.placeholder = data.token_set ? "gesetzt — leer lassen = unverändert" : "Long-Lived Access Token aus Home Assistant";
   $("#climate-token-clear").hidden = !data.token_set;
@@ -604,7 +666,10 @@ function renderClimateStatus(st) {
 
 loaders.climate = async () => {
   try {
-    renderClimate(await api("GET", "/api/climate"));
+    if (!lastStatus) await refreshStatus();  // the fan names label the channel boxes
+    const [data, options] = await Promise.all([api("GET", "/api/climate"), api("GET", "/api/climate/options").catch(() => null)]);
+    climateOptions = options;
+    renderClimate(data);
   } catch (e) {
     showMsg($("#climate-msg"), `Klima-Einstellungen nicht lesbar: ${e.message}`, false);
   }
@@ -625,14 +690,18 @@ $("#climate-save").addEventListener("click", async () => {
   const btn = $("#climate-save");
   btn.disabled = true;
   try {
-    renderClimate(await api("PUT", "/api/climate", climateBody(CLIMATE_FIELDS, values, climateTokenInput.value.trim())));
-    showMsg($("#climate-msg"), "Gespeichert.", true);
+    const res = await api("PUT", "/api/climate", climateBody(CLIMATE_FIELDS, values, climateTokenInput.value.trim()));
+    renderClimate(res);
+    showMsg($("#climate-msg"), climateSavedText(res), !res.notice);
+    await reloadClimateOptions();  // address or token may have changed
   } catch (e) {
     showMsg($("#climate-msg"), e.message, false);
   } finally {
     btn.disabled = false;
   }
 });
+
+$("#climate-options-reload").addEventListener("click", reloadClimateOptions);
 
 $("#climate-test").addEventListener("click", async () => {
   const btn = $("#climate-test");
@@ -661,9 +730,7 @@ loaders.backups = async () => {
   tbody.replaceChildren();
   for (const b of items) {
     const btn = el("button", {}, "Wiederherstellen");
-    let armed = false;
-    btn.addEventListener("click", async () => {
-      if (!armed) { armed = true; btn.textContent = "Wirklich wiederherstellen?"; btn.className = "danger"; return; }
+    armedClick(btn, "Wirklich wiederherstellen?", async () => {
       btn.disabled = true;
       try {
         showMsg($("#backup-msg"), savedText(await api("POST", `/api/backups/${encodeURIComponent(b.name)}/restore`, {})), true);
