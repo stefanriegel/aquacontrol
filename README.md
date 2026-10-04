@@ -78,6 +78,21 @@ deaktiviert** (`enabled: false`, keine HA-Adresse). Details: `docs/superpowers/s
   Werte liest aquacontrol aus Home Assistant (eingebaute Listen, falls HA nicht erreichbar ist).
 - API: `GET`/`PUT /api/climate`, `POST /api/climate/test`, `GET /api/climate/options`.
 
+## LED-Editor
+
+Der Tab „LEDs“ bearbeitet die LED-Effekte direkt im QUADRO, ohne Aquasuite:
+
+- **Farbschalter** (Farbe nach Temperatur): bis zu fünf Schwellen (ganze °C, streng steigend, innerhalb des gespeicherten
+  Bereichs), je Schwelle eine Farbe, Datenquelle (Temperatursensor 1–4) sowie Überblenden, Blinken und Helligkeit nach
+  Datenquelle. Eine Vorschau-Leiste zeigt die Farbbereiche und den aktuellen Messwert.
+- **Statische Farbe**: eine Farbe plus die drei Schalter.
+- Nicht benutzte Controller werden nicht angezeigt. LED-Bereiche, Modus und andere Effektwerte bleiben unverändert; andere
+  Datenquellen (Durchfluss, Software-Sensoren) werden nur angezeigt.
+- Jede Änderung legt vorher ein Backup an. Beim Wiederherstellen eines Backups dürfen sich LED-Daten unterscheiden
+  (Pumpe und Lüfter werden weiterhin vollständig geprüft).
+- API: `GET /api/settings` (`leds[]`) und `PUT /api/settings/led/1..8` mit `thresholds`, `colors` (`"#rrggbb"`), `fade`,
+  `blink`, `brightness_by_source`, `source`. Die Byte-Belegung steht in `docs/led-layout.md`.
+
 ## Pushing extra sensors (e.g. GPUs from a VM)
 
 ```bash
