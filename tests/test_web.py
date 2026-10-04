@@ -20,11 +20,12 @@ from aquacontrol.fake import FakeTransport
 from aquacontrol.monitor import Monitor
 from aquacontrol.schedule import Scheduler
 from aquacontrol.sensors import ExternalStore
-from aquacontrol.ha import HAError
+from aquacontrol.ha import HAClient, HAError
 from aquacontrol.validate import make_check
 from aquacontrol import web
 from aquacontrol.web import App, make_server
 from tests.fixtures import load
+from tests.test_ha import FakeHA
 from tests.test_climate import E as CLIMATE_ENTITY, FakeClient, H as HSEL, V as VSEL
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
@@ -608,6 +609,137 @@ class WebTest(unittest.TestCase):
         status, resp = self.req("POST", "/api/climate/test", {})
         self.assertEqual(status, 502)
         self.assertIn(VSEL, resp["error"])
+
+    # --- climate options (what the Klima tab offers in its drop-downs) ------------------------------------
+    FALLBACK = {"hvac_modes": ["cool", "dry", "fan_only"], "preset_modes": ["Normal", "Quiet", "Powerful"],
+                "fan_modes": ["Automatic", "1", "2", "3", "4", "5"],
+                "horizontal": ["auto", "left", "left_center", "center", "right_center", "right"],
+                "vertical": ["swing", "auto", "up", "up_center", "center", "down_center", "down"]}
+    LISTS = ("hvac_modes", "preset_modes", "fan_modes", "horizontal", "vertical")
+
+    def fill_ha(self):
+        self.ha.states[CLIMATE_ENTITY]["attributes"].update({
+            "hvac_modes": ["off", "heat_cool", "cool", "heat", "fan_only", "dry"],
+            "preset_modes": ["Normal", "Powerful", "Quiet", "Eco"],
+            "fan_modes": ["Automatic", "1", "2", "3", "4", "5"]})
+        self.ha.states[HSEL]["attributes"] = {"options": ["auto", "left", "center", "right"]}
+        self.ha.states[VSEL]["attributes"] = {"options": ["swing", "auto", "up", "down"]}
+        self.ha.extra_states = {
+            "climate.bedroom": {"state": "off", "attributes": {"hvac_modes": ["cool", "heat"], "fan_modes": ["low", "high"]}},
+            "select.some_other_thing": {"state": "a", "attributes": {"options": ["a", "b"]}},
+            "select.bedroom_swing_horizontal": {"state": "a", "attributes": {"options": ["a", "b"]}},
+            "light.kitchen": {"state": "on", "attributes": {}},
+            "sensor.water": {"state": "31", "attributes": {}}}
+
+    def test_climate_options_require_auth(self):
+        status, _ = self.req("GET", "/api/climate/options", auth=False)
+        self.assertEqual(status, 401)
+
+    def test_climate_options_fall_back_when_home_assistant_is_not_set_up(self):
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp["source"], "fallback")
+        self.assertIn("eingerichtet", resp["error"])
+        for key in self.LISTS:
+            self.assertEqual(resp[key], self.FALLBACK[key])
+        self.assertEqual(resp["fallback"], self.FALLBACK)
+        self.assertEqual((resp["climate_entities"], resp["select_entities"]), ([], []))
+        self.assertEqual(self.ha.log, [])
+
+    def test_climate_options_come_from_home_assistant(self):
+        self.configure_ha()
+        self.fill_ha()
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp["source"], "ha")
+        self.assertIsNone(resp["error"])
+        self.assertEqual(resp["hvac_modes"], ["cool", "fan_only", "dry"])   # only what a cooling automation can use
+        self.assertEqual(resp["preset_modes"], ["Normal", "Powerful", "Quiet", "Eco"])
+        self.assertEqual(resp["fan_modes"], ["Automatic", "1", "2", "3", "4", "5"])
+        self.assertEqual(resp["horizontal"], ["auto", "left", "center", "right"])
+        self.assertEqual(resp["vertical"], ["swing", "auto", "up", "down"])
+        self.assertEqual(resp["climate_entities"], ["climate.bedroom", CLIMATE_ENTITY])
+        self.assertEqual(resp["select_entities"], ["select.bedroom_swing_horizontal", HSEL, VSEL])  # only "swing"
+        self.assertEqual(resp["fallback"], self.FALLBACK)
+        self.assertEqual(self.ha.calls, [])
+        self.assertNotIn(self.TOKEN, json.dumps(resp))
+
+    def test_climate_options_list_every_select_when_none_mentions_swing(self):
+        self.configure_ha()
+        self.fill_ha()
+        for eid in (HSEL, VSEL, "select.bedroom_swing_horizontal"):
+            self.ha.states.pop(eid, None)
+            self.ha.extra_states.pop(eid, None)
+        self.ha.states["select.louvre_h"] = {"state": "a", "attributes": {"options": ["a"]}}
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(resp["select_entities"], ["select.louvre_h", "select.some_other_thing"])
+
+    def test_climate_options_fall_back_per_list_when_home_assistant_does_not_say(self):
+        self.configure_ha()
+        self.ha.states[CLIMATE_ENTITY]["attributes"] = {"preset_modes": [], "fan_modes": "nonsense",
+                                                        "hvac_modes": ["heat", "off"]}
+        self.ha.states[HSEL]["attributes"] = {"options": ["only", 5, None]}
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(resp["source"], "ha")
+        self.assertEqual(resp["hvac_modes"], self.FALLBACK["hvac_modes"])   # nothing usable among heat/off
+        self.assertEqual(resp["preset_modes"], self.FALLBACK["preset_modes"])
+        self.assertEqual(resp["fan_modes"], self.FALLBACK["fan_modes"])
+        self.assertEqual(resp["horizontal"], ["only"])
+        self.assertEqual(resp["vertical"], self.FALLBACK["vertical"])
+
+    def test_climate_options_when_home_assistant_fails(self):
+        self.configure_ha()
+        self.ha.failing = {"get"}
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp["source"], "fallback")
+        self.assertIn("Home Assistant", resp["error"])
+        self.assertNotIn(self.TOKEN, json.dumps(resp))
+        for key in self.LISTS:
+            self.assertEqual(resp[key], self.FALLBACK[key])
+
+    def test_climate_options_for_another_entity(self):
+        self.configure_ha()
+        self.fill_ha()
+        status, resp = self.req("GET", "/api/climate/options?entity_id=climate.bedroom"
+                                       "&horizontal_select=select.bedroom_swing_horizontal")
+        self.assertEqual(resp["hvac_modes"], ["cool"])
+        self.assertEqual(resp["fan_modes"], ["low", "high"])
+        self.assertEqual(resp["preset_modes"], self.FALLBACK["preset_modes"])
+        self.assertEqual(resp["horizontal"], ["a", "b"])
+        for query in ("entity_id=switch.x", "horizontal_select=climate.x", "vertical_select=select.A%20b"):
+            with self.subTest(query=query):
+                status, resp = self.req("GET", "/api/climate/options?" + query)
+                self.assertEqual(status, 400)
+
+    def test_climate_options_unknown_entity_is_reported(self):
+        self.configure_ha()
+        self.fill_ha()
+        self.req("PUT", "/api/climate", {"entity_id": "climate.gone"})
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(resp["source"], "ha")
+        self.assertIn("climate.gone", resp["error"])
+        self.assertEqual(resp["hvac_modes"], self.FALLBACK["hvac_modes"])
+        self.assertIn("climate.bedroom", resp["climate_entities"])
+
+    def test_climate_options_against_a_real_http_client(self):
+        fake = FakeHA()
+        self.addCleanup(fake.close)
+        fake.reply = (200, json.dumps([
+            {"entity_id": CLIMATE_ENTITY, "state": "off", "attributes": {"preset_modes": ["Normal", "Quiet"]}},
+            {"entity_id": VSEL, "state": "auto", "attributes": {"options": ["auto", "down"]}},
+            {"entity_id": "light.x", "state": "on", "attributes": {}}]).encode())
+        self.configure_ha()
+        self.app.ha_client_factory = lambda: HAClient(fake.url, self.TOKEN)
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp["preset_modes"], ["Normal", "Quiet"])
+        self.assertEqual(resp["vertical"], ["auto", "down"])
+        self.assertEqual(resp["horizontal"], self.FALLBACK["horizontal"])
+        self.assertEqual(resp["climate_entities"], [CLIMATE_ENTITY])
+        self.assertEqual(resp["select_entities"], [VSEL])
+        self.assertEqual([(m, path, auth) for m, path, auth, *_ in fake.requests],
+                         [("GET", "/api/states", f"Bearer {self.TOKEN}")])
 
     def test_climate_status_reflects_the_controller(self):
         self.req("PUT", "/api/climate", {"enabled": True})

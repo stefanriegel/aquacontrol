@@ -76,6 +76,17 @@ class HAClient:
             raise HAError("Home Assistant: unerwartete Antwort")
         return state
 
+    def get_states(self) -> list[dict]:
+        """Every entity with its state and attributes (GET /api/states)."""
+        raw = self._request("GET", "/api/states")
+        try:
+            states = json.loads(raw)
+        except ValueError:
+            raise HAError("Home Assistant: Antwort ist kein gültiges JSON") from None
+        if not isinstance(states, list) or not all(isinstance(s, dict) for s in states):
+            raise HAError("Home Assistant: unerwartete Antwort")
+        return states
+
     def call(self, domain: str, service: str, data: dict) -> None:
         self._request("POST", f"/api/services/{urllib.parse.quote(domain, safe='')}/"
                               f"{urllib.parse.quote(service, safe='')}", data)

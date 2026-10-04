@@ -70,6 +70,21 @@ class HAClientTest(unittest.TestCase):
         method, path, auth, _, _ = self.ha.requests[0]
         self.assertEqual((method, path, auth), ("GET", "/api/states/climate.panasonic_ac", f"Bearer {TOKEN}"))
 
+    def test_get_states_lists_every_entity(self):
+        self.ha.reply = (200, json.dumps([{"entity_id": "climate.a", "state": "off", "attributes": {}},
+                                          {"entity_id": "select.b", "state": "x", "attributes": {"options": ["x"]}}]).encode())
+        states = self.client.get_states()
+        self.assertEqual([s["entity_id"] for s in states], ["climate.a", "select.b"])
+        method, path, auth, _, _ = self.ha.requests[0]
+        self.assertEqual((method, path, auth), ("GET", "/api/states", f"Bearer {TOKEN}"))
+
+    def test_get_states_rejects_anything_but_a_list_of_objects(self):
+        for payload in (b"{}", b"null", b"<html>", b"[1, 2]", b'"x"'):
+            with self.subTest(payload=payload):
+                self.ha.reply = (200, payload)
+                with self.assertRaises(HAError):
+                    self.client.get_states()
+
     def test_trailing_slash_in_base_url(self):
         HAClient(self.ha.url + "/", TOKEN).get_state("climate.x")
         self.assertEqual(self.ha.requests[0][1], "/api/states/climate.x")

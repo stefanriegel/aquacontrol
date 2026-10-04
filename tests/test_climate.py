@@ -40,6 +40,16 @@ class FakeClient:
             V: {"state": "auto", "attributes": {}},
         }
 
+    extra_states = None  # more entities for get_states(): {entity_id: {"state": ..., "attributes": {...}}}
+
+    def get_states(self):
+        self.log.append(("get", "*"))
+        self.stamps.append(("get", self.clock()))
+        self._maybe_fail("get")
+        everything = {**self.states, **(self.extra_states or {})}
+        return [{"entity_id": eid, "state": v.get("state"), "attributes": dict(v.get("attributes", {}))}
+                for eid, v in everything.items()]
+
     def _maybe_fail(self, key):
         if key in self.failing or "*" in self.failing:
             raise HAError("Home Assistant nicht erreichbar: Test")

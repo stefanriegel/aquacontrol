@@ -129,11 +129,18 @@ class ParseClimateConfigTest(unittest.TestCase):
     def test_ac_choices(self):
         self.bad({"ac": {"hvac_mode": "heat"}}, "hvac_mode")
         self.bad({"ac": {"hvac_mode": "off"}})
-        self.bad({"ac": {"preset": "Turbo"}}, "Preset")
-        self.bad({"ac": {"fan_mode": "6"}}, "Lüfter")
-        self.bad({"ac": {"fan_mode": 3}}, "Lüfter")
-        self.bad({"ac": {"horizontal": "up"}}, "horizontal")
-        self.bad({"ac": {"vertical": "left"}}, "vertical")
+
+    def test_options_of_the_ac_come_from_home_assistant_so_any_plain_name_is_valid(self):
+        # the UI offers what HA reports (preset_modes, fan_modes, select options), which differs per device
+        cfg = self.good({"ac": {"preset": "Eco+", "fan_mode": "Medium High", "horizontal": "wide_left",
+                                "vertical": "Swing-Up"}})
+        self.assertEqual((cfg.ac.preset, cfg.ac.fan_mode, cfg.ac.horizontal, cfg.ac.vertical),
+                         ("Eco+", "Medium High", "wide_left", "Swing-Up"))
+        for key, fragment in (("preset", "Preset"), ("fan_mode", "Lüfter"), ("horizontal", "horizontal"),
+                              ("vertical", "vertical")):
+            for v in ("", " ", " x", "x ", "a\nb", "a\x00b", "x" * 65, 3, None, ["x"]):
+                with self.subTest(key=key, v=v):
+                    self.bad({"ac": {key: v}}, fragment)
 
     def test_ha_url(self):
         for v in ("ftp://x", "ha", "http://", "javascript:alert(1)", "http://a b", 5, None,

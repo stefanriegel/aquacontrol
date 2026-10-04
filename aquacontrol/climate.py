@@ -151,6 +151,14 @@ def _choice(v: object, allowed: tuple[str, ...], what: str) -> str:
     return v
 
 
+def _option(v: object, what: str) -> str:
+    """A name the AC reports as one of its options (preset, fan mode, louvre position). The valid set differs per
+    device and comes from Home Assistant, so only the form is checked here."""
+    if not isinstance(v, str) or not re.fullmatch(r"[^\x00-\x1f\x7f\s](?:[^\x00-\x1f\x7f]{0,62}[^\x00-\x1f\x7f\s])?", v):
+        raise ClimateConfigError(f"{what} muss ein Name aus der Auswahl der Klimaanlage sein (1 bis 64 Zeichen)")
+    return v
+
+
 def _entity(v: object, domain: str, what: str) -> str:
     if not isinstance(v, str) or not re.fullmatch(rf"{domain}\.[a-z0-9_]+", v):
         raise ClimateConfigError(f"{what} muss die Form {domain}.name haben (Kleinbuchstaben, Ziffern, _)")
@@ -206,10 +214,10 @@ def parse_climate_config(raw: object) -> ClimateConfig:
         raise ClimateConfigError("Temperatur der Klimaanlage muss 16 bis 30 °C in 0,5er-Schritten sein")
     ac = ACConfig(_choice(get(ac_raw, "hvac_mode", d["ac"]), HVAC_MODES, "hvac_mode"),
                   float(temperature),
-                  _choice(get(ac_raw, "preset", d["ac"]), PRESETS, "Preset"),
-                  _choice(get(ac_raw, "fan_mode", d["ac"]), FAN_MODES, "Lüfterstufe"),
-                  _choice(get(ac_raw, "horizontal", d["ac"]), HORIZONTAL, "horizontal"),
-                  _choice(get(ac_raw, "vertical", d["ac"]), VERTICAL, "vertical"))
+                  _option(get(ac_raw, "preset", d["ac"]), "Preset"),
+                  _option(get(ac_raw, "fan_mode", d["ac"]), "Lüfterstufe"),
+                  _option(get(ac_raw, "horizontal", d["ac"]), "horizontal"),
+                  _option(get(ac_raw, "vertical", d["ac"]), "vertical"))
 
     max_switches = get(raw, "max_switches_per_hour", d)
     if isinstance(max_switches, bool) or not isinstance(max_switches, int) or not 1 <= max_switches <= MAX_SWITCHES_LIMIT:

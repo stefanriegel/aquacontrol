@@ -21,7 +21,8 @@ from typing import Callable
 from . import protocol as p
 from .auth import token_source, verify_password
 from .backups import BackupError, BackupStore
-from .climate import ClimateConfigError, ClimateController
+from .climate import (FAN_MODES, HORIZONTAL, HVAC_MODES, PRESETS, VERTICAL, ClimateConfigError, ClimateController,
+                      _entity as parse_entity)
 from .config import AppConfig, Secrets
 from .device import Device, DeviceError
 from .ha import HAError
@@ -324,6 +325,57 @@ class App:
                 "horizontal": read(cfg.horizontal_select).get("state"),
                 "vertical": read(cfg.vertical_select).get("state")}
 
+    def climate_options(self, query: dict[str, list[str]] | None = None) -> dict:
+        """What the Klima tab may offer in its drop-downs: the lists Home Assistant reports for the AC and the two
+        louvre selects, plus all climate and (swing) select entities. Falls back to built-in lists, never fails
+        because of Home Assistant: `source` says which one it is and `error` why."""
+        if self.climate is None:
+            raise NotFound()
+        query = query or {}
+        cfg = self.config.climate_config()
+
+        def wanted(key: str, domain: str, default: str) -> str:
+            return parse_entity(query[key][0], domain, key) if key in query else default
+
+        entity = wanted("entity_id", "climate", cfg.entity_id)
+        h_select = wanted("horizontal_select", "select", cfg.horizontal_select)
+        v_select = wanted("vertical_select", "select", cfg.vertical_select)
+        fallback = {"hvac_modes": list(HVAC_MODES), "preset_modes": list(PRESETS), "fan_modes": list(FAN_MODES),
+                    "horizontal": list(HORIZONTAL), "vertical": list(VERTICAL)}
+        out: dict = {"source": "fallback", "error": None, **{k: list(v) for k, v in fallback.items()},
+                     "climate_entities": [], "select_entities": [], "fallback": fallback}
+        client = self.ha_client_factory() if self.ha_client_factory else None
+        if client is None:
+            out["error"] = "Home Assistant ist nicht eingerichtet: URL und Token speichern, dann Auswahl neu laden"
+            return out
+        try:
+            states = client.get_states()
+        except HAError as e:
+            out["error"] = str(e)
+            return out
+        by_id = {s["entity_id"]: s for s in states if isinstance(s.get("entity_id"), str)}
+        out["source"] = "ha"
+        out["climate_entities"] = sorted(e for e in by_id if e.startswith("climate."))
+        selects = sorted(e for e in by_id if e.startswith("select."))
+        out["select_entities"] = [e for e in selects if "swing" in e] or selects
+
+        def listed(entity_id: str, attribute: str) -> list[str]:
+            attrs = by_id.get(entity_id, {}).get("attributes")
+            values = attrs.get(attribute) if isinstance(attrs, dict) else None
+            return [v for v in values if isinstance(v, str) and v] if isinstance(values, list) else []
+
+        if entity not in by_id:
+            out["error"] = f"{entity} wurde in Home Assistant nicht gefunden"
+        for key, source, attribute in (("hvac_modes", entity, "hvac_modes"), ("preset_modes", entity, "preset_modes"),
+                                       ("fan_modes", entity, "fan_modes"), ("horizontal", h_select, "options"),
+                                       ("vertical", v_select, "options")):
+            values = listed(source, attribute)
+            if key == "hvac_modes":  # only modes a cooling automation can use (not off, heat, auto)
+                values = [v for v in values if v in HVAC_MODES]
+            if values:
+                out[key] = values
+        return out
+
     def backups_json(self) -> list[dict]:
         return [asdict(b) for b in self.backups.list()]
 
@@ -443,6 +495,9 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 return self._send(200, app.schedule_json())
             if method == "GET" and path == "/api/climate":
                 return self._send(200, app.climate_json())
+            if method == "GET" and path == "/api/climate/options":
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                return self._send(200, app.climate_options(query))
             if method == "GET" and path == "/api/backups":
                 return self._send(200, app.backups_json())
             if method in ("PUT", "POST"):
