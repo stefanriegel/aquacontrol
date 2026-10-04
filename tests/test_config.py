@@ -1,10 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from aquacontrol.auth import hash_password, hash_token, token_source, verify_password
-from aquacontrol.config import (AppConfig, ConfigError, load_daemon_config, update_daemon_config)
+from aquacontrol.climate import DEFAULT_CLIMATE, ClimateConfigError
+from aquacontrol.config import (AppConfig, ConfigError, Secrets, load_daemon_config, update_daemon_config)
 from aquacontrol.schedule import ScheduleError
 
 
@@ -102,6 +104,148 @@ class AppConfigTest(unittest.TestCase):
         self.path.write_text("{")
         with self.assertRaises(ConfigError):
             AppConfig(self.path)
+
+
+class SecretsTest(unittest.TestCase):
+    TOKEN = "eyJhbGciOi.s3cr3t-token_value.sig"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name, "secrets.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_file_means_no_token(self):
+        self.assertEqual(Secrets(self.path).get_ha_token(), "")
+        self.assertFalse(self.path.exists())
+
+    def test_roundtrip_and_mode_0600(self):
+        old = os.umask(0)  # even a permissive umask must not leak the file
+        self.addCleanup(os.umask, old)
+        sec = Secrets(self.path)
+        sec.set_ha_token(self.TOKEN)
+        self.assertEqual(sec.get_ha_token(), self.TOKEN)
+        self.assertEqual(Secrets(self.path).get_ha_token(), self.TOKEN)  # persisted
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(self.path.read_text()), {"ha_token": self.TOKEN})
+
+    def test_existing_loose_mode_is_tightened(self):
+        self.path.write_text("{}")
+        os.chmod(self.path, 0o644)
+        Secrets(self.path).set_ha_token(self.TOKEN)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_empty_string_clears(self):
+        sec = Secrets(self.path)
+        sec.set_ha_token(self.TOKEN)
+        sec.set_ha_token("")
+        self.assertEqual(sec.get_ha_token(), "")
+        self.assertEqual(Secrets(self.path).get_ha_token(), "")
+        self.assertNotIn(self.TOKEN, self.path.read_text())
+
+    def test_other_keys_are_kept(self):
+        self.path.write_text(json.dumps({"other": "x"}))
+        Secrets(self.path).set_ha_token(self.TOKEN)
+        self.assertEqual(json.loads(self.path.read_text()), {"other": "x", "ha_token": self.TOKEN})
+
+    def test_write_is_atomic_no_temp_files_left(self):
+        Secrets(self.path).set_ha_token(self.TOKEN)
+        self.assertEqual([p.name for p in Path(self.tmp.name).iterdir()], ["secrets.json"])
+
+    def test_surrounding_whitespace_is_stripped_and_bad_tokens_rejected(self):
+        sec = Secrets(self.path)
+        sec.set_ha_token(f"  {self.TOKEN}\n")
+        self.assertEqual(sec.get_ha_token(), self.TOKEN)
+        for bad in ("a b", "x\ny", "tökən", "a" * 5000, 5, None):
+            with self.subTest(bad=bad), self.assertRaises(ClimateConfigError):
+                sec.set_ha_token(bad)
+        self.assertEqual(sec.get_ha_token(), self.TOKEN)  # unchanged
+
+    def test_corrupt_file_is_no_token_and_not_fatal(self):
+        self.path.write_text("{nope")
+        sec = Secrets(self.path)
+        self.assertEqual(sec.get_ha_token(), "")
+        sec.set_ha_token(self.TOKEN)
+        self.assertEqual(sec.get_ha_token(), self.TOKEN)
+
+    def test_token_is_never_logged(self):
+        with self.assertNoLogs(level="DEBUG"):
+            sec = Secrets(self.path)
+            sec.set_ha_token(self.TOKEN)
+            sec.get_ha_token()
+            sec.set_ha_token("")
+
+
+class ClimateSectionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name, "config.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_defaults_without_file(self):
+        cfg = AppConfig(self.path)
+        self.assertEqual(cfg.climate_raw(), DEFAULT_CLIMATE)
+        self.assertFalse(cfg.climate_config().enabled)
+        self.assertEqual(cfg.climate_raw()["ha_url"], "")
+
+    def test_secrets_live_next_to_config(self):
+        cfg = AppConfig(self.path)
+        self.assertEqual(cfg.secrets.path, Path(self.tmp.name, "secrets.json"))
+
+    def test_set_climate_persists_atomically_and_keeps_other_sections(self):
+        self.path.write_text(json.dumps({"schedule": [{"time": "22:00", "target": "strip", "on": False}],
+                                         "backup_dir": "/x"}))
+        cfg = AppConfig(self.path)
+        raw = {**DEFAULT_CLIMATE, "enabled": True, "ha_url": "http://ha.example:8123"}
+        cfg.set_climate(raw)
+        again = AppConfig(self.path)
+        self.assertTrue(again.climate_config().enabled)
+        self.assertEqual(again.climate_raw()["ha_url"], "http://ha.example:8123")
+        disk = json.loads(self.path.read_text())
+        self.assertEqual(disk["backup_dir"], "/x")
+        self.assertEqual(len(again.rules()), 1)
+        self.assertEqual([p.name for p in Path(self.tmp.name).iterdir()], ["config.json"])
+
+    def test_set_climate_invalid_keeps_old_and_writes_nothing(self):
+        cfg = AppConfig(self.path)
+        cfg.set_climate({**DEFAULT_CLIMATE, "enabled": True})
+        before = self.path.read_text()
+        with self.assertRaises(ClimateConfigError):
+            cfg.set_climate({**DEFAULT_CLIMATE, "on": {**DEFAULT_CLIMATE["on"], "minutes": 0}})
+        self.assertEqual(self.path.read_text(), before)
+        self.assertTrue(cfg.climate_config().enabled)
+
+    def test_patch_climate_merges_onto_current(self):
+        cfg = AppConfig(self.path)
+        cfg.set_climate({**DEFAULT_CLIMATE, "ha_url": "http://ha.example:8123"})
+        cfg.patch_climate({"on": {"minutes": 7}, "enabled": True})
+        raw = cfg.climate_raw()
+        self.assertEqual(raw["ha_url"], "http://ha.example:8123")
+        self.assertEqual(raw["on"], {**DEFAULT_CLIMATE["on"], "minutes": 7})
+        self.assertTrue(raw["enabled"])
+        with self.assertRaises(ClimateConfigError):
+            cfg.patch_climate({"ac": {"hvac_mode": "heat"}})
+        self.assertEqual(cfg.climate_raw()["ac"]["hvac_mode"], "cool")
+
+    def test_climate_raw_is_a_copy(self):
+        cfg = AppConfig(self.path)
+        cfg.climate_raw()["on"]["minutes"] = 99
+        self.assertEqual(cfg.climate_raw()["on"]["minutes"], 5)
+
+    def test_invalid_stored_section_falls_back_to_defaults(self):
+        self.path.write_text(json.dumps({"climate": {"enabled": True, "on": {"minutes": 0}}}))
+        with self.assertLogs("aquacontrol.config", level="WARNING"):
+            cfg = AppConfig(self.path)
+        self.assertEqual(cfg.climate_raw(), DEFAULT_CLIMATE)  # disabled: the safe side
+
+    def test_token_never_lands_in_config_json(self):
+        cfg = AppConfig(self.path)
+        cfg.secrets.set_ha_token("abc.def.ghi")
+        cfg.set_climate(DEFAULT_CLIMATE)
+        self.assertNotIn("abc.def.ghi", self.path.read_text())
 
 
 if __name__ == "__main__":

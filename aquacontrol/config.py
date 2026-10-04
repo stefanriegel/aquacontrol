@@ -3,13 +3,18 @@ config.json (daemon-owned, rewritten atomically when the schedule changes)."""
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .climate import ClimateConfig, ClimateConfigError, merge_climate, parse_climate_config
 from .schedule import Rule, parse_rules, rules_to_json
+
+log = logging.getLogger(__name__)
 
 DEFAULT_APP_CONFIG = {
     "fans": {"1": {"name": "Pumpe", "min_percent": 25}, "2": {"name": "140mm Radiator"},
@@ -62,22 +67,71 @@ def update_daemon_config(path: str | Path, **changes) -> None:
     _atomic_write(p, raw, mode=0o640)
 
 
-def _atomic_write(path: Path, data: dict, mode: int = 0o644) -> None:
+def _atomic_write(path: Path, data: dict, mode: int = 0o644, force_mode: bool = False) -> None:
+    """Write JSON via temp file + rename. An existing file keeps its mode and owner, unless force_mode is set."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    if path.exists():
-        st = path.stat()
-        os.chmod(tmp, st.st_mode & 0o777)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")  # created 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        if force_mode:
+            os.chmod(tmp, mode)
+        elif path.exists():
+            st = path.stat()
+            os.chmod(tmp, st.st_mode & 0o777)
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+        else:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            os.chown(tmp, st.st_uid, st.st_gid)
-        except PermissionError:
+            os.unlink(tmp)
+        except OSError:
             pass
-    else:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+        raise
+
+
+class Secrets:
+    """secrets.json next to config.json (mode 0600). Holds the Home Assistant token; the token is never
+    logged and never leaves this class except through get_ha_token()."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            raw = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            log.warning("%s is unreadable, treating it as empty", self.path)
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def get_ha_token(self) -> str:
+        with self._lock:
+            token = self._load().get("ha_token", "")
+        return token if isinstance(token, str) else ""
+
+    def set_ha_token(self, token: str) -> None:
+        """Store the token; an empty string removes it."""
+        if not isinstance(token, str):
+            raise ClimateConfigError("Token muss ein Text sein")
+        token = token.strip()
+        if token and not re.fullmatch(r"[\x21-\x7e]{1,4096}", token):
+            raise ClimateConfigError("Token enthält ungültige Zeichen oder ist zu lang")
+        with self._lock:
+            data = self._load()
+            if token:
+                data["ha_token"] = token
+            else:
+                data.pop("ha_token", None)
+            _atomic_write(self.path, data, mode=0o600, force_mode=True)
 
 
 class AppConfig:
@@ -92,6 +146,12 @@ class AppConfig:
         else:
             self._raw = json.loads(json.dumps(DEFAULT_APP_CONFIG))
         self._rules = parse_rules(self._raw.get("schedule", []))
+        self.secrets = Secrets(self.path.with_name("secrets.json"))
+        try:
+            self._climate = parse_climate_config(self._raw.get("climate", {}))
+        except ClimateConfigError as e:  # a broken section must not stop the daemon; automation stays off
+            log.warning("%s: ungültiger climate-Abschnitt (%s), Klima-Automatik bleibt aus", self.path, e)
+            self._climate = parse_climate_config({})
 
     def fan_name(self, index: int, fallback: str) -> str:
         return self._raw.get("fans", {}).get(str(index + 1), {}).get("name") or fallback
@@ -136,3 +196,35 @@ class AppConfig:
             _atomic_write(self.path, self._raw)
             self._rules = rules
         return rules
+
+    # --- climate automation -------------------------------------------------------------------------
+    def climate_config(self) -> ClimateConfig:
+        with self._lock:
+            return self._climate
+
+    def climate_raw(self) -> dict:
+        """The full climate section (defaults filled in) as a fresh dict. Never contains the token."""
+        with self._lock:
+            return self._climate.to_json()
+
+    def set_climate(self, raw: object) -> ClimateConfig:
+        cfg = parse_climate_config(raw)  # raises ClimateConfigError before anything is written
+        with self._lock:
+            self._store_climate(cfg)
+        return cfg
+
+    def patch_climate(self, patch: object) -> ClimateConfig:
+        """Partial update: merge onto the current section under the lock, validate, persist."""
+        if not isinstance(patch, dict):
+            raise ClimateConfigError("Klima-Konfiguration muss ein Objekt sein")
+        with self._lock:
+            cfg = parse_climate_config(merge_climate(self._climate.to_json(), patch))
+            self._store_climate(cfg)
+        return cfg
+
+    def _store_climate(self, cfg: ClimateConfig) -> None:
+        raw = dict(self._raw)
+        raw["climate"] = cfg.to_json()
+        _atomic_write(self.path, raw)
+        self._raw = raw
+        self._climate = cfg
