@@ -34,8 +34,29 @@ def _device_id(hw: Path) -> str:
     return link.resolve().name if link.exists() else hw.name
 
 
+def _friendly_label(chip: str, label: str, ram_rank: int | None) -> str | None:
+    """German display label for well-known hwmon channels, None when there is no better name than the id."""
+    if chip == "k10temp":
+        if label == "Tctl":
+            return "CPU"
+        m = re.fullmatch(r"Tccd(\d+)", label)
+        if m:
+            return f"CPU CCD{m.group(1)}"
+    elif chip == "spd5118" and ram_rank is not None:
+        return f"RAM {ram_rank}"
+    elif chip == "amdgpu" and label == "edge":
+        return "iGPU"
+    elif chip == "nvme":
+        if label == "Composite":
+            return "NVMe"
+        if re.fullmatch(r"Sensor \d+", label):
+            return f"NVMe {label}"
+    return None
+
+
 def read_host_sensors(labels: dict[str, str | None], sys_root: str | Path = "/sys/class/hwmon") -> list[Reading]:
-    """All hwmon temperatures except the QUADRO's. `labels` renames (str) or hides (None)."""
+    """All hwmon temperatures except the QUADRO's. `labels` renames (str) or hides (None); without a
+    configured label a friendly German one is derived for well-known chips (see _friendly_label)."""
     out: list[Reading] = []
     root = Path(sys_root)
     if not root.is_dir():
@@ -58,17 +79,24 @@ def read_host_sensors(labels: dict[str, str | None], sys_root: str | Path = "/sy
     # Ids must be unique and stable across reboots (hwmonN numbering is not): when "<name>/<label>"
     # occurs more than once, every member becomes "<name>@<dev>/<label>" (dev = bus address of the device).
     counts = Counter(f"{name}/{label}" for _, name, label, _ in found)
+    ids = []
     for hw, name, label, inp in found:
         sid = f"{name}/{label}"
         if counts[sid] > 1:
             sid = f"{name}@{_device_id(hw)}/{label}"
+        ids.append(sid)
+    # RAM modules are numbered in id order over all of them, hidden or renamed ones included, so a
+    # module keeps its number when a neighbour is hidden
+    ram_ids = sorted(sid for sid, (_, name, _, _) in zip(ids, found) if name == "spd5118")
+    for sid, (hw, name, label, inp) in zip(ids, found):
         if sid in labels and labels[sid] is None:
             continue
         try:
             value = int(inp.read_text().strip()) / 1000
         except (OSError, ValueError):
             continue  # e.g. ENODATA for an unconnected sensor
-        out.append(Reading(sid, labels.get(sid) or sid, value, "°C"))
+        rank = ram_ids.index(sid) + 1 if name == "spd5118" else None
+        out.append(Reading(sid, labels.get(sid) or _friendly_label(name, label, rank) or sid, value, "°C"))
     return out
 
 

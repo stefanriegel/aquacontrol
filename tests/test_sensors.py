@@ -52,7 +52,7 @@ class HostSensorsTest(unittest.TestCase):
         hwmon(root, 2, "nvme", {"temp1": ("Composite", "40000")})
         r = read_host_sensors({"spd5118@1-0053/temp1": "DIMM B"}, root)
         self.assertEqual([x.id for x in r], ["spd5118@1-0051/temp1", "spd5118@1-0053/temp1", "nvme/Composite"])
-        self.assertEqual([x.label for x in r][:2], ["spd5118@1-0051/temp1", "DIMM B"])
+        self.assertEqual([x.label for x in r][:2], ["RAM 1", "DIMM B"])
         self.assertEqual([x.value for x in r][:2], [41.0, 42.0])
         self.assertEqual(read_host_sensors({"spd5118@1-0051/temp1": None}, root)[0].id, "spd5118@1-0053/temp1")
 
@@ -66,6 +66,58 @@ class HostSensorsTest(unittest.TestCase):
 
     def test_missing_root(self):
         self.assertEqual(read_host_sensors({}, "/nonexistent"), [])
+
+
+class FriendlyLabelsTest(unittest.TestCase):
+    """A fake hwmon tree like the real host."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name, "hwmon")
+        self.root.mkdir()
+        devs = Path(self.tmp.name, "devs")
+        hwmon(self.root, 0, "nvme", {"temp1": ("Composite", "40000"), "temp2": ("Sensor 1", "41000"),
+                                     "temp3": ("Sensor 2", "42000")})
+        hwmon(self.root, 1, "k10temp", {"temp1": ("Tctl", "51000"), "temp3": ("Tccd1", "39000"),
+                                        "temp4": ("Tccd2", "38000")})
+        for idx, dev in ((2, "2-0051"), (3, "2-0050")):  # hwmon numbering is the reverse of the bus addresses
+            hwmon(self.root, idx, "spd5118", {"temp1": (None, "4%d000" % idx)})
+            (devs / dev).mkdir(parents=True)
+            (self.root / f"hwmon{idx}" / "device").symlink_to(devs / dev)
+        hwmon(self.root, 5, "amdgpu", {"temp1": ("edge", "35000")})
+        hwmon(self.root, 6, "acpitz", {"temp1": (None, "27000")})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_derived_labels(self):
+        labels = {r.id: r.label for r in read_host_sensors({}, self.root)}
+        self.assertEqual(labels, {
+            "nvme/Composite": "NVMe", "nvme/Sensor 1": "NVMe Sensor 1", "nvme/Sensor 2": "NVMe Sensor 2",
+            "k10temp/Tctl": "CPU", "k10temp/Tccd1": "CPU CCD1", "k10temp/Tccd2": "CPU CCD2",
+            "spd5118@2-0050/temp1": "RAM 1", "spd5118@2-0051/temp1": "RAM 2",
+            "amdgpu/edge": "iGPU", "acpitz/temp1": "acpitz/temp1"})
+
+    def test_ram_numbering_follows_id_order_not_hwmon_order(self):
+        r = {x.id: x for x in read_host_sensors({}, self.root)}
+        self.assertEqual(r["spd5118@2-0050/temp1"].value, 43.0)  # hwmon3
+        self.assertEqual(r["spd5118@2-0050/temp1"].label, "RAM 1")
+
+    def test_config_label_wins_and_none_hides(self):
+        r = {x.id: x.label for x in read_host_sensors(
+            {"k10temp/Tctl": "Prozessor", "nvme/Composite": None, "spd5118@2-0050/temp1": "DIMM A"}, self.root)}
+        self.assertEqual(r["k10temp/Tctl"], "Prozessor")
+        self.assertNotIn("nvme/Composite", r)
+        self.assertEqual(r["spd5118@2-0050/temp1"], "DIMM A")
+        self.assertEqual(r["k10temp/Tccd1"], "CPU CCD1")
+
+    def test_hidden_or_renamed_neighbours_keep_the_ram_numbers(self):
+        r = {x.id: x.label for x in read_host_sensors({"spd5118@2-0050/temp1": None}, self.root)}
+        self.assertEqual(r["spd5118@2-0051/temp1"], "RAM 2")
+
+    def test_empty_config_label_falls_back_to_derived(self):
+        r = {x.id: x.label for x in read_host_sensors({"k10temp/Tctl": ""}, self.root)}
+        self.assertEqual(r["k10temp/Tctl"], "CPU")
 
 
 class ExternalStoreTest(unittest.TestCase):
