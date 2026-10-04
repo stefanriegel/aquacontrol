@@ -254,6 +254,66 @@ class HistoryPersistenceTest(unittest.TestCase):
                 self.assertIn("Verlauf", logs.output[0])
                 self.assertEqual(self.mon.history(60), [])
 
+    def test_damaged_deflate_body_warns_and_starts_empty(self):
+        entries = [{"t": int(self.clock.t) - 10 * i, "temp1": 20.0 + i / 7} for i in range(1, 400)]
+        payload = json.dumps({"version": 1, "bucket_s": 10, "saved_at": 1, "history": entries}).encode()
+        good = gzip.compress(payload)  # no file name in the header: byte 10 is the first deflate byte
+        for name, pos in (("first deflate byte (zlib.error)", 10), ("middle (CRC mismatch)", len(good) // 2)):
+            with self.subTest(name):
+                raw = bytearray(good)
+                raw[pos] ^= 0xFF
+                self.path.write_bytes(bytes(raw))
+                mon = self.fresh()
+                with self.assertLogs("aquacontrol.monitor", "WARNING") as logs:
+                    mon.load_history(self.path)
+                self.assertIn("Verlauf", logs.output[0])
+                self.assertEqual(mon.history(60), [])
+
+    def test_hostile_json_never_crashes_the_load(self):
+        now = int(self.clock.t)
+        hist = lambda *e: {"version": 1, "bucket_s": 10, "saved_at": now, "history": list(e)}  # noqa: E731
+        cases = {
+            "huge int value": json.dumps(hist({"t": now - 10, "temp1": 1})).replace('"temp1": 1}', '"temp1": %s}' % ("9" * 400)),
+            "huge int t": json.dumps(hist({"t": 1, "temp1": 1})).replace('"t": 1,', '"t": %s,' % ("9" * 400)),
+            "deeply nested": '{"version": 1, "bucket_s": 10, "history": ' + "[" * 200000 + "]" * 200000 + "}",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.path.write_bytes(gzip.compress(text.encode()))
+                with self.assertLogs("aquacontrol.monitor", "WARNING") as logs:
+                    self.mon.load_history(self.path)
+                self.assertIn("Verlauf", logs.output[0])
+                self.assertEqual(self.mon.history(60), [])
+
+    def test_oversized_file_is_refused(self):
+        self.fill(self.mon)
+        self.mon.save_history(self.path)
+        other = self.fresh()
+        with mock.patch("aquacontrol.monitor.HISTORY_MAX_BYTES", 100), \
+                self.assertLogs("aquacontrol.monitor", "WARNING") as logs:
+            other.load_history(self.path)
+        self.assertIn("Verlauf", logs.output[0])
+        self.assertEqual(other.history(60), [])
+        other.load_history(self.path)  # within the limit it loads
+        self.assertEqual(len(other.history(60)), 2)
+
+    def test_future_entries_are_dropped_on_load(self):
+        now = int(self.clock.t)
+        self.write({"version": 1, "bucket_s": 10, "saved_at": now + 9999, "history": [
+            {"t": now - 10, "temp1": 1.0}, {"t": now + 10, "temp1": 2.0},  # one bucket ahead is tolerated
+            {"t": now + 11, "temp1": 3.0}, {"t": now + 9999, "temp1": 4.0}]})
+        self.mon.load_history(self.path)
+        self.assertEqual([h["t"] for h in self.mon._history], [now - 10, now + 10])
+
+    def test_stale_temp_files_are_removed_on_load(self):
+        stale = [Path(self.tmp.name, "history.json.gz.abc123.tmp"), Path(self.tmp.name, "history.json.gz.x.tmp")]
+        keep = [Path(self.tmp.name, "config.json"), Path(self.tmp.name, "other.abc.tmp"),
+                Path(self.tmp.name, "history.json.gz.abc123")]
+        for p in stale + keep:
+            p.write_bytes(b"x")
+        self.mon.load_history(self.path)  # the history file itself does not exist
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(p.name for p in keep))
+
     def test_missing_file_is_silent(self):
         with self.assertNoLogs("aquacontrol.monitor", "WARNING"):
             self.mon.load_history(self.path)
@@ -327,6 +387,28 @@ class PeriodicSaveTest(unittest.TestCase):
             mon.run(stop)
         # 14 reads x 100 s = 1400 s: saves after 300, 600, 900 and 1200 s
         self.assertEqual(save.call_count, 4)
+
+    def test_a_backward_clock_jump_does_not_stall_the_saving(self):
+        clock = Clock()
+        stop = threading.Event()
+        reads = []
+
+        class Reader:
+            def read(self, timeout):
+                reads.append(1)
+                clock.t += 100 if len(reads) != 2 else -5000  # an NTP step back after the first read
+                if len(reads) >= 4:
+                    stop.set()
+                return None
+
+            def close(self):
+                pass
+
+        mon = Monitor(open_reader=Reader, clock=clock, history_path=Path("/nonexistent/h.gz"))
+        with mock.patch.object(mon, "save_history") as save:
+            mon.run(stop)
+        # read 2 jumps back: due at once (1 save); then the interval counts from the new time: 2 x 100 s < 300 s
+        self.assertEqual(save.call_count, 1)
 
     def test_no_save_without_a_path(self):
         clock = Clock()

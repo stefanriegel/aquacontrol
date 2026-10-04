@@ -3,6 +3,7 @@ second; host and external sensors are sampled on their own cadence, so they keep
 updating while the QUADRO is offline."""
 from __future__ import annotations
 
+import glob
 import gzip
 import json
 import logging
@@ -27,6 +28,7 @@ EXTRA_INTERVAL_S = 2.0  # cadence of host/external sensor sampling
 HISTORY_SAVE_S = 300.0  # cadence of saving the history to disk
 HISTORY_VERSION = 1
 HISTORY_MODE = 0o640
+HISTORY_MAX_BYTES = 32 * 2 ** 20  # decompressed; a real file is a few hundred KB
 
 
 def _number(v: object) -> bool:
@@ -153,39 +155,55 @@ class Monitor:
 
     def load_history(self, path: Path | str | None = None) -> None:
         """Replace the history with what `save_history` wrote. A missing file is normal (first start); an
-        unreadable or foreign one is logged and ignored. Entries outside the history window are dropped."""
+        unreadable, oversized or foreign one is logged and ignored, whatever is wrong with it: a bad history
+        file must never keep the daemon from starting. Entries outside the history window are dropped.
+        Also removes temp files a killed save left behind."""
         source = Path(path if path is not None else self._history_path)
+        self._remove_stale_temp_files(source)
         try:
-            with gzip.open(source, "rt", encoding="utf-8") as f:
-                data = json.load(f)
+            with gzip.open(source, "rb") as f:
+                raw = f.read(HISTORY_MAX_BYTES + 1)
+            if len(raw) > HISTORY_MAX_BYTES:
+                raise ValueError(f"mehr als {HISTORY_MAX_BYTES // 2 ** 20} MB")
+            data = json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict) or not isinstance(data.get("history"), list):
                 raise ValueError("unerwartetes Format")
+            if data.get("version") != HISTORY_VERSION or data.get("bucket_s") != self._bucket_s:
+                log.info("Verlauf in %s hat ein anderes Format (Version %r, Raster %r s), wird ignoriert",
+                         source, data.get("version"), data.get("bucket_s"))
+                return
+            now = self._clock()
+            cutoff, latest = now - self._history_s, now + self._bucket_s  # a clock that was wrong once leaves future entries
+            entries = []
+            for h in data["history"]:
+                if not isinstance(h, dict) or not _number(h.get("t")) or not cutoff <= h["t"] <= latest:
+                    continue
+                entries.append({k: v for k, v in h.items() if isinstance(k, str) and _number(v)})
+            entries.sort(key=lambda h: h["t"])
         except FileNotFoundError:
             return
-        except (OSError, EOFError, ValueError) as e:  # BadGzipFile is an OSError, JSON/Unicode errors ValueErrors
+        except Exception as e:  # zlib.error, OverflowError, RecursionError, MemoryError-ish, OSError, ValueError ...
             log.warning("Verlauf in %s nicht lesbar, starte leer: %s", source, e)
             return
-        if data.get("version") != HISTORY_VERSION or data.get("bucket_s") != self._bucket_s:
-            log.info("Verlauf in %s hat ein anderes Format (Version %r, Raster %r s), wird ignoriert",
-                        source, data.get("version"), data.get("bucket_s"))
-            return
-        cutoff = self._clock() - self._history_s
-        entries = []
-        for h in data["history"]:
-            if not isinstance(h, dict) or not _number(h.get("t")) or h["t"] < cutoff:
-                continue
-            entries.append({k: v for k, v in h.items() if isinstance(k, str) and _number(v)})
-        entries.sort(key=lambda h: h["t"])
         with self._lock:
             self._history.clear()
             self._history.extend(entries)  # the maxlen keeps the newest
+
+    @staticmethod
+    def _remove_stale_temp_files(target: Path) -> None:
+        for stale in target.parent.glob(glob.escape(target.name) + ".*.tmp"):
+            try:
+                if stale.is_file() and not stale.is_symlink():
+                    stale.unlink()
+            except OSError as e:
+                log.warning("Verlauf: %s konnte nicht gelöscht werden: %s", stale, e)
 
     def _maybe_save(self) -> None:
         """Save if HISTORY_SAVE_S of (injected) clock time have passed since the last save; never raises."""
         if self._history_path is None:
             return
         now = self._clock()
-        if now - self._last_save < HISTORY_SAVE_S:
+        if 0 <= now - self._last_save < HISTORY_SAVE_S:  # a backward clock jump (negative) counts as due
             return
         self._last_save = now  # a failing disk is retried at the next interval, not on every loop
         try:

@@ -98,6 +98,7 @@ class MainTest(unittest.TestCase):
         def save_history(mon, path=None):
             history_paths.append(("save", Path(path)))
             events.append("history-saved")
+            order.append("save")
             real_save(mon, path)
 
         real_run = main_mod.Scheduler.run
@@ -115,10 +116,12 @@ class MainTest(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         joins = []
+        order = []  # joins and the history save in the order they happen
         real_join = threading.Thread.join
 
         def join(thread, timeout=None):
             joins.append((thread.name, timeout))
+            order.append("join-" + thread.name)
             return real_join(thread, timeout)
 
         threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
@@ -132,11 +135,17 @@ class MainTest(unittest.TestCase):
                                 "run", "--fake", str(FIXTURES), "--no-tls", "--listen", "127.0.0.1",
                                 "--port", str(port)])
         self.assertEqual(rc, 0)
-        # the history is loaded before the monitor thread starts and saved once after it (and the others) stopped,
-        # right before the device goes away
+        # the history is loaded before the monitor thread starts; it is saved once, right after the monitor
+        # thread stopped and before the slow joins (a stuck Home Assistant call must not cost the save); the
+        # device is closed last
         self.assertEqual(events[0], "history-loaded")
-        self.assertEqual(sorted(events[1:-2]), ["climate-stopped", "monitor-stopped", "scheduler-stopped"])
-        self.assertEqual(events[-2:], ["history-saved", "close"])
+        self.assertEqual(events[-1], "close")
+        self.assertEqual(sorted(events[1:-1]),
+                         ["climate-stopped", "history-saved", "monitor-stopped", "scheduler-stopped"])
+        self.assertLess(events.index("monitor-stopped"), events.index("history-saved"))
+        slow = [order.index(n) for n in ("join-http", "join-scheduler", "join-climate")]
+        self.assertLess(order.index("join-monitor"), order.index("save"))
+        self.assertLess(order.index("save"), min(slow))
         history_file = self.app.parent / "history.json.gz"  # next to config.json
         self.assertEqual(history_paths, [("load", history_file), ("save", history_file)])
         self.assertTrue(history_file.exists())

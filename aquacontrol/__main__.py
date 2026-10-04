@@ -132,10 +132,21 @@ def cmd_run(args) -> int:
         log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
         stop.wait()  # a signal that came earlier has already set it
     finally:
-        # order: stop event -> http server -> scheduler and climate -> device -> socket. A running device
+        # order: stop event -> monitor + history save -> http server -> scheduler and climate -> device ->
+        # socket. A running device
         # write (scheduler or request thread) finishes before the process exits; the climate thread only
         # talks to Home Assistant, but is joined too so no switch is cut off half way.
         stop.set()
+        # the monitor does not touch the device: stop it and save the history first, so a slow scheduler or
+        # Home Assistant call below cannot cost the save (systemd's stop timeout)
+        for t in threads:
+            if t.name == "monitor" and t.ident is not None:
+                t.join(SHUTDOWN_MONITOR_JOIN_S)
+        if history_loaded:
+            try:
+                monitor.save_history(history_path(args))
+            except Exception as e:  # a full disk must not keep the device open
+                log.warning("Verlauf konnte nicht gespeichert werden: %s", e)
         if serving is not None and serving.is_alive() and not failure:  # shutdown() waits for a live serve loop
             server.shutdown()
         if serving is not None and serving.ident is not None:
@@ -146,11 +157,6 @@ def cmd_run(args) -> int:
         for t in threads:
             if t.name == "monitor" and t.ident is not None:
                 t.join(SHUTDOWN_MONITOR_JOIN_S)
-        if history_loaded:
-            try:
-                monitor.save_history(history_path(args))
-            except Exception as e:  # a full disk must not keep the device open
-                log.warning("Verlauf konnte nicht gespeichert werden: %s", e)
         device.close()
         if server is not None:
             server.server_close()
