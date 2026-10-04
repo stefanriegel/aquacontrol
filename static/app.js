@@ -197,6 +197,18 @@ loaders.fans = async () => {
   updateOperatingPoints();
 };
 
+// Request body for saving a fan. `sensor` is only sent if the user picked one, so a controller whose
+// stored sensor is outside 1-4 is never changed by an unrelated save.
+function fanSaveBody(v) {
+  const body = { mode: v.mode, min_percent: v.min, max_percent: v.max };
+  if (v.sensorChanged) body.sensor = v.sensor;
+  if (v.mode === "fixed") body.fixed_percent = v.fixed;
+  if (v.mode === "target") body.target_c = v.target;
+  if (v.mode === "curve") body.curve = v.curve;
+  if (!["fixed", "target", "curve"].includes(v.mode)) delete body.mode;
+  return body;
+}
+
 function fanEditor(fan, sensorNames) {
   const state = { fan, curve: fan.curve.map((p) => [...p]) };
   fanState.push(state);
@@ -207,6 +219,9 @@ function fanEditor(fan, sensorNames) {
   const fixed = el("input", { type: "number", min: 0, max: 100, step: 0.5, value: fan.fixed_percent });
   const target = el("input", { type: "number", min: 20, max: 60, step: 0.5, value: fan.target_c });
   const sensor = el("select", {}, ...sensorNames.map((n, i) => el("option", { value: i, selected: fan.sensor === i }, `${i + 1}: ${n}`)));
+  if (!sensorNames.some((_, i) => i === fan.sensor)) sensor.prepend(el("option", { value: fan.sensor, selected: true, disabled: true }, `${fan.sensor} (nur Anzeige)`));
+  let sensorChanged = false;
+  sensor.addEventListener("change", () => { sensorChanged = true; });
   const min = el("input", { type: "number", min: fan.floor_percent ?? 0, max: 100, step: 0.5, value: fan.min_percent });
   const max = el("input", { type: "number", min: 0, max: 100, step: 0.5, value: fan.max_percent });
   const chart = svg("svg", { class: "curve", viewBox: "0 0 400 240" });
@@ -226,11 +241,8 @@ function fanEditor(fan, sensorNames) {
 
   const save = el("button", { class: "primary" }, "Speichern");
   save.addEventListener("click", async () => {
-    const body = { mode: mode.value, sensor: Number(sensor.value), min_percent: Number(min.value), max_percent: Number(max.value) };
-    if (mode.value === "fixed") body.fixed_percent = Number(fixed.value);
-    if (mode.value === "target") body.target_c = Number(target.value);
-    if (mode.value === "curve") body.curve = state.curve;
-    if (!["fixed", "target", "curve"].includes(mode.value)) delete body.mode;
+    const body = fanSaveBody({ mode: mode.value, sensor: Number(sensor.value), sensorChanged, min: Number(min.value),
+      max: Number(max.value), fixed: Number(fixed.value), target: Number(target.value), curve: state.curve });
     save.disabled = true;
     try {
       showMsg(msg, savedText(await api("PUT", `/api/settings/fan/${fan.index}`, body)), true);
