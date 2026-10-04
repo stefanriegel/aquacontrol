@@ -463,5 +463,79 @@ class ChartGeometryTest(unittest.TestCase):
         self.assertEqual(anchor(380), "end")
 
 
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class AppJsSyntaxTest(unittest.TestCase):
+    def test_app_js_parses(self):
+        out = subprocess.run(["node", "--check", str(APP_JS)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_functions_are_defined_once(self):
+        names = re.findall(r"^(?:async )?function (\w+)\(", APP_JS.read_text(), re.M)
+        self.assertEqual(sorted(n for n in set(names) if names.count(n) > 1), [])
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class DrawChartSmokeTest(unittest.TestCase):
+    """Runs the real drawChart (and its helpers) from app.js against a stub svg()/root."""
+
+    NOW = 1_700_000_000
+
+    def draw(self, minutes, data, visible=("temp1",)):
+        src = APP_JS.read_text()
+        a = src.index("// The chart's x-axis")
+        b = src.index('$("#hist-range").addEventListener', a)
+        script = ('const COLORS = ["--s1", "--s2"];\n'
+                  'function svg(n, a = {}) { return { n, a, style: {}, textContent: "" }; }\n' + src[a:b] +
+                  '\nconst [minutes, data, visible, now] = JSON.parse(process.argv[1]);\n'
+                  'const root = { out: [], replaceChildren() { this.out = []; }, append(x) { this.out.push(x); } };\n'
+                  'drawChart(root, data, visible, ["temp1", "temp2"], minutes, now);\n'
+                  'console.log(JSON.stringify(root.out));')
+        out = subprocess.run(["node", "-e", script, json.dumps([minutes, data, list(visible), self.NOW])],
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def x_of(self, nodes, t, minutes):
+        """x of time t in a 800-wide chart with the window ending at NOW (L=40, right pad 5)."""
+        t0 = self.NOW - minutes * 60
+        return 40 + (t - t0) / (minutes * 60) * (800 - 40 - 5)
+
+    def test_the_x_axis_spans_the_selected_window_not_the_data(self):
+        data = [{"t": self.NOW - 30, "temp1": 30.0}, {"t": self.NOW - 20, "temp1": 30.5},
+                {"t": self.NOW - 10, "temp1": 31.0}]
+        xs = {}
+        for minutes in (60, 180, 360):
+            nodes = self.draw(minutes, data)
+            line = next(n for n in nodes if n["n"] == "polyline")
+            pts = [tuple(map(float, p.split(","))) for p in line["a"]["points"].split()]
+            xs[minutes] = [p[0] for p in pts]
+            self.assertAlmostEqual(pts[-1][0], self.x_of(nodes, self.NOW - 10, minutes), delta=0.1)
+        for minutes in (60, 180, 360):  # the newest data sits at the right end, the span shrinks as the window grows
+            self.assertGreater(xs[minutes][0], 700)
+        self.assertLess(xs[60][-1] - xs[60][0], 800)
+        self.assertLess(xs[360][-1] - xs[360][0], xs[60][-1] - xs[60][0])
+
+    def test_tick_labels_follow_the_window(self):
+        data = [{"t": self.NOW - 120, "temp1": 30.0}, {"t": self.NOW - 10, "temp1": 31.0}]
+        times = lambda m: [n["textContent"] for n in self.draw(m, data) if n["n"] == "text" and ":" in n["textContent"]]
+        self.assertIn(len(times(60)), (4, 5))
+        self.assertIn(len(times(360)), (6, 7))
+
+    def test_a_gap_makes_two_polylines_and_old_data_is_clipped(self):
+        data = [{"t": self.NOW - 7200, "temp1": 20.0}, {"t": self.NOW - 600, "temp1": 30.0},
+                {"t": self.NOW - 590, "temp1": 30.5}, {"t": self.NOW - 100, "temp1": 31.0},
+                {"t": self.NOW - 90, "temp1": 31.5}]
+        nodes = self.draw(60, data)
+        self.assertEqual(len([n for n in nodes if n["n"] == "polyline"]), 2)
+        self.assertEqual([n["textContent"] for n in nodes if n["textContent"].endswith("°")][0], "29°")  # 20 was clipped
+
+    def test_no_data_in_the_window_shows_the_message_and_one_point_is_drawn(self):
+        self.assertEqual([n["textContent"] for n in self.draw(60, [{"t": self.NOW - 9000, "temp1": 30.0}])],
+                         ["Noch zu wenig Daten"])
+        nodes = self.draw(60, [{"t": self.NOW - 10, "temp1": 30.0}])
+        self.assertEqual(len([n for n in nodes if n["n"] == "circle"]), 1)
+        self.assertTrue(any(n["n"] == "line" for n in nodes))  # axes are there
+
+
 if __name__ == "__main__":
     unittest.main()

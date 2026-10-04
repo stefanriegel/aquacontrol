@@ -193,7 +193,9 @@ function drawChart(root, data, visible, allKeys, minutes, now) {
     root.append(Object.assign(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }), { textContent: "Noch zu wenig Daten" }));
     return;
   }
-  const lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
+  let vmin = Infinity, vmax = -Infinity;
+  for (const v of vals) { if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+  const lo = Math.floor(vmin - 1), hi = Math.ceil(vmax + 1);
   const x = (t) => L + ((t - t0) / (t1 - t0)) * (W - L - 5);
   const y = (v) => T + (1 - (v - lo) / (hi - lo || 1)) * (H - T - B);
   for (let i = 0; i <= 4; i++) {
@@ -204,7 +206,7 @@ function drawChart(root, data, visible, allKeys, minutes, now) {
   for (const t of chartTicks(minutes, t0, t1)) {
     const label = new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
     root.append(svg("line", { x1: x(t), x2: x(t), y1: T, y2: H - B, class: "gridline" }));
-    root.append(Object.assign(svg("text", { x: x(t), y: H - 4, "text-anchor": chartLabelAnchor(x(t), L, W, 20) }), { textContent: label }));
+    root.append(Object.assign(svg("text", { x: x(t), y: H - 4, "text-anchor": x(t) > W - 20 ? "end" : x(t) < L + 1 ? "start" : "middle" }), { textContent: label }));
   }
   for (const k of visible) {
     const color = `var(${COLORS[allKeys.indexOf(k) % COLORS.length]})`;
@@ -219,59 +221,6 @@ function drawChart(root, data, visible, allKeys, minutes, now) {
       line.style.stroke = color;
       root.append(line);
     }
-  }
-}
-
-$("#hist-range").value}`);
-  } catch { return; }
-  const keys = [...new Set(data.flatMap((d) => Object.keys(d)))]
-    .filter((k) => k !== "t" && !k.endsWith("_rpm") && !k.endsWith("_percent") && k !== "flow");
-  const series = $("#series");
-  series.replaceChildren();
-  keys.forEach((k, i) => {
-    const color = `var(${COLORS[i % COLORS.length]})`;
-    const cb = el("input", { type: "checkbox", checked: !hiddenSeries.has(k) });
-    cb.addEventListener("change", () => {
-      cb.checked ? hiddenSeries.delete(k) : hiddenSeries.add(k);
-      localStorageSet("hiddenSeries", JSON.stringify([...hiddenSeries]));
-      refreshHistory();
-    });
-    const sw = el("span", { class: "swatch" });
-    sw.style.background = color;
-    series.append(el("label", {}, cb, sw, seriesLabel(k)));
-  });
-  const newest = data.length ? data[data.length - 1].t : 0;
-  drawChart($("#chart"), data, keys.filter((k) => !hiddenSeries.has(k)), keys, minutes, Math.max(newest, Date.now() / 1000));
-}
-
-function drawChart(root, data, visible, allKeys) {
-  root.replaceChildren();
-  const W = 800, H = 260, L = 40, B = 20, T = 10;
-  if (data.length < 2 || visible.length === 0) {
-    root.append(Object.assign(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }), { textContent: "Noch zu wenig Daten" }));
-    return;
-  }
-  const vals = data.flatMap((d) => visible.map((k) => d[k]).filter((v) => v !== undefined));
-  let lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
-  const t0 = data[0].t, t1 = data[data.length - 1].t;
-  const x = (t) => L + ((t - t0) / (t1 - t0 || 1)) * (W - L - 5);
-  const y = (v) => T + (1 - (v - lo) / (hi - lo || 1)) * (H - T - B);
-  for (let i = 0; i <= 4; i++) {
-    const v = lo + ((hi - lo) * i) / 4;
-    root.append(svg("line", { x1: L, x2: W, y1: y(v), y2: y(v), class: "gridline" }));
-    root.append(Object.assign(svg("text", { x: 4, y: y(v) + 4 }), { textContent: `${v.toFixed((hi - lo) / 4 < 1 ? 1 : 0)}°` }));
-  }
-  for (const frac of [0, 0.5, 1]) {
-    const t = t0 + (t1 - t0) * frac;
-    const label = new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
-    root.append(Object.assign(svg("text", { x: x(t), y: H - 4, "text-anchor": frac === 0 ? "start" : frac === 1 ? "end" : "middle" }), { textContent: label }));
-  }
-  for (const k of visible) {
-    const idx = allKeys.indexOf(k);
-    const pts = data.filter((d) => d[k] !== undefined).map((d) => `${x(d.t).toFixed(1)},${y(d[k]).toFixed(1)}`);
-    const line = svg("polyline", { points: pts.join(" "), fill: "none", "stroke-width": 2 });
-    line.style.stroke = `var(${COLORS[idx % COLORS.length]})`;
-    root.append(line);
   }
 }
 
