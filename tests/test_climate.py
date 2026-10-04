@@ -1,9 +1,11 @@
 import threading
 import unittest
 
-from aquacontrol.climate import (BACKOFF_S, INTERVAL_S, ClimateController, merge_climate, parse_climate_config,
-                                 DEFAULT_CLIMATE)
-from aquacontrol.ha import HAError
+from types import SimpleNamespace
+
+from aquacontrol.climate import (BACKOFF_S, DEFAULT_CLIMATE, INTERVAL_S, ClimateController, make_client_factory,
+                                 merge_climate, parse_climate_config)
+from aquacontrol.ha import HAClient, HAError
 
 E = "climate.panasonic_ac_panasonic_ac"
 H = "select.panasonic_ac_panasonic_ac_horizontal_swing_mode"
@@ -98,12 +100,14 @@ class Rig:
         self.now = 1_000_000.0
         self.client = FakeClient()
         self.client_available = True
+        self.factory_calls = 0
         self.cfg = parse_climate_config(merge_climate(DEFAULT_CLIMATE,
                                                       {"enabled": True, "ha_url": "http://ha.example:8123", **patch}))
         self.snapshot = hot()
         self.ctrl = ClimateController(lambda: self.snapshot, self.factory, lambda: self.cfg, clock=lambda: self.now)
 
     def factory(self):
+        self.factory_calls += 1
         return self.client if self.client_available else None
 
     def set_cfg(self, **patch):
@@ -749,6 +753,12 @@ class DisabledTest(unittest.TestCase):
         self.assertEqual(r.client.log, [])
         self.assertEqual(r.state(), "disabled")
 
+    def test_disabled_never_even_builds_a_client(self):
+        r = Rig(enabled=False)
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.factory_calls, 0)
+
     def test_status_reflects_disabling_immediately(self):
         r = Rig()
         r.tick()
@@ -849,6 +859,31 @@ class StatusTest(unittest.TestCase):
         release.set()
         t.join(5)
         self.assertFalse(t.is_alive())
+
+
+class ClientFactoryTest(unittest.TestCase):
+    def config(self, url, token):
+        cfg = parse_climate_config({"ha_url": url})
+        return SimpleNamespace(climate_config=lambda: cfg, secrets=SimpleNamespace(get_ha_token=lambda: token))
+
+    def test_none_without_url_or_token(self):
+        self.assertIsNone(make_client_factory(self.config("", "tok"))())
+        self.assertIsNone(make_client_factory(self.config("http://ha.example:8123", ""))())
+
+    def test_client_with_both(self):
+        client = make_client_factory(self.config("http://ha.example:8123", "tok"))()
+        self.assertIsInstance(client, HAClient)
+        self.assertEqual(client.base_url, "http://ha.example:8123")
+        self.assertNotIn("tok", repr(client))
+
+    def test_follows_config_changes(self):
+        state = {"url": "", "token": ""}
+        cfg = SimpleNamespace(climate_config=lambda: parse_climate_config({"ha_url": state["url"]}),
+                              secrets=SimpleNamespace(get_ha_token=lambda: state["token"]))
+        factory = make_client_factory(cfg)
+        self.assertIsNone(factory())
+        state.update(url="http://ha.example:8123", token="tok")
+        self.assertIsNotNone(factory())
 
 
 class RunLoopTest(unittest.TestCase):

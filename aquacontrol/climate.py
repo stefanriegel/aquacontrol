@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
-from .ha import HAError
+from .ha import HAClient, HAError
 
 DEFAULT_CLIMATE: dict = {
     "enabled": False,
@@ -239,6 +239,15 @@ def _fmt_c(v: float) -> str:
 
 def _minutes_left(seconds: float) -> int:
     return max(1, math.ceil(seconds / 60))
+
+
+def make_client_factory(config) -> Callable[[], HAClient | None]:
+    """A factory that follows the live config: an HAClient once URL and token are set, else None.
+    `config` is an AppConfig (climate_config() and secrets.get_ha_token())."""
+    def factory() -> HAClient | None:
+        url, token = config.climate_config().ha_url, config.secrets.get_ha_token()
+        return HAClient(url, token) if url and token else None
+    return factory
 
 
 class ClimateController:

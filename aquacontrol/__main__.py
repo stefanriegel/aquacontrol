@@ -9,9 +9,11 @@ import signal
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 
 from .auth import hash_password, hash_token, new_token
 from .backups import BackupStore
+from .climate import ClimateController, make_client_factory
 from .config import AppConfig, ConfigError, load_daemon_config, update_daemon_config
 from .device import Device
 from .monitor import Monitor
@@ -46,6 +48,12 @@ def build(args) -> tuple[Device, Monitor, Scheduler, BackupStore, AppConfig, Ext
     return device, monitor, scheduler, backups, config, externals
 
 
+def build_climate(monitor: Monitor, config: AppConfig) -> tuple[ClimateController, Callable[[], object | None]]:
+    """The climate controller (idle while disabled in the config) and the HA client factory it shares with the API."""
+    factory = make_client_factory(config)
+    return ClimateController(monitor.snapshot, factory, config.climate_config), factory
+
+
 def cmd_run(args) -> int:
     try:
         daemon = load_daemon_config(args.daemon_config)
@@ -66,8 +74,9 @@ def cmd_run(args) -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     device, monitor, scheduler, backups, config, externals = build(args)
+    climate, ha_client_factory = build_climate(monitor, config)
     app = App(device, monitor, scheduler, backups, config, externals, daemon.password_hash,
-              daemon.push_tokens, args.static)
+              daemon.push_tokens, args.static, climate=climate, ha_client_factory=ha_client_factory)
     creds = os.environ.get("CREDENTIALS_DIRECTORY")
     cert = key = None
     if creds and not args.no_tls:
@@ -81,6 +90,7 @@ def cmd_run(args) -> int:
     threads = [threading.Thread(target=monitor.run, args=(stop,), name="monitor", daemon=True)]
     if not args.no_schedule:
         threads.append(threading.Thread(target=scheduler.run, args=(stop,), name="scheduler", daemon=True))
+    threads.append(threading.Thread(target=climate.run, args=(stop,), name="climate", daemon=True))
     serving = threading.Thread(target=server.serve_forever, name="http", daemon=True)
     started_serving = False
     try:
@@ -91,14 +101,15 @@ def cmd_run(args) -> int:
         log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
         stop.wait()  # a signal that came earlier has already set it
     finally:
-        # order: stop event -> http server -> scheduler -> device -> socket. A running device write
-        # (scheduler or request thread) finishes before the process exits.
+        # order: stop event -> http server -> scheduler and climate -> device -> socket. A running device
+        # write (scheduler or request thread) finishes before the process exits; the climate thread only
+        # talks to Home Assistant, but is joined too so no switch is cut off half way.
         stop.set()
         if started_serving:
             server.shutdown()
             serving.join(15)
         for t in threads:
-            if t.name == "scheduler":
+            if t.name in ("scheduler", "climate"):
                 t.join(15)
         device.close()
         server.server_close()

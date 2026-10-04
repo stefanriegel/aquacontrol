@@ -35,6 +35,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual(device.read_settings().strip_brightness, 218)
         self.assertEqual(device.read_names().fans[0], "Pumpe")
 
+    def test_build_climate_follows_the_config(self):
+        args = argparse.Namespace(app_config=str(self.app), fake=str(FIXTURES))
+        device, monitor, scheduler, backups, config, externals = main_mod.build(args)
+        controller, factory = main_mod.build_climate(monitor, config)
+        self.assertEqual(controller.status()["state"], "disabled")  # off by default
+        self.assertIsNone(factory())
+        config.patch_climate({"ha_url": "http://ha.example:8123"})
+        config.secrets.set_ha_token("tok")
+        self.assertIsNotNone(factory())
+
     def test_set_password(self):
         with mock.patch("getpass.getpass", side_effect=["langes-passwort", "langes-passwort"]), \
                 redirect_stdout(io.StringIO()):
@@ -72,21 +82,28 @@ class MainTest(unittest.TestCase):
             real_close(dev)
 
         real_run = main_mod.Scheduler.run
+        real_climate_run = main_mod.ClimateController.run
 
         def run(sched, stop):
             real_run(sched, stop)
             events.append("scheduler-stopped")
 
+        def climate_run(ctrl, stop):
+            real_climate_run(ctrl, stop)
+            events.append("climate-stopped")
+
         with socket.socket() as probe:  # a free port (the CLI treats 0 as "use the default")
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
-        with mock.patch.object(Device, "close", close), mock.patch.object(main_mod.Scheduler, "run", run):
+        with mock.patch.object(Device, "close", close), mock.patch.object(main_mod.Scheduler, "run", run), \
+                mock.patch.object(main_mod.ClimateController, "run", climate_run):
             rc = main_mod.main(["--daemon-config", str(self.daemon), "--app-config", str(self.app),
                                 "run", "--fake", str(FIXTURES), "--no-tls", "--listen", "127.0.0.1",
                                 "--port", str(port)])
         self.assertEqual(rc, 0)
-        self.assertEqual(events, ["scheduler-stopped", "close"])
+        self.assertEqual(sorted(events[:-1]), ["climate-stopped", "scheduler-stopped"])
+        self.assertEqual(events[-1], "close")  # both threads are joined before the device goes away
 
     def test_signal_during_startup_still_stops_the_daemon(self):
         """SIGTERM/SIGINT arriving before serve_forever() (here: right after the server socket exists)
