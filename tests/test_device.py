@@ -152,6 +152,50 @@ class DeviceTest(unittest.TestCase):
         self.assertTrue(result.changed)
         self.assertEqual(self.fake.settings, self.original)
 
+    def _patched(self, patch):
+        """The original report with `patch(bytearray)` applied and a valid CRC."""
+        r = bytearray(self.original)
+        patch(r)
+        r[959:961] = p.crc16_usb(bytes(r[1:959])).to_bytes(2, "big")
+        return bytes(r)
+
+    def test_restore_allows_other_led_strip_profile_and_offset_bytes(self):
+        def patch(r):
+            r[397 + 70 * 2 + 3] = 0x12            # C3 becomes a Farbschalter
+            r[397 + 70 * 2 + 1:397 + 70 * 2 + 3] = bytes([5, 7])  # other LED range
+            r[397 + 26:397 + 28] = (41).to_bytes(2, "big")  # C1 threshold
+            r[394] = 10                           # strip brightness
+            r[395:397] = b"\x00\x02"              # strip off
+            r[957] = 3                            # profile
+            r[10:12] = (150).to_bytes(2, "big")   # sensor offset
+        backup = self._patched(patch)
+        self.assertEqual(p.decode_settings(backup).leds[2].mode, 0x12)
+        result = self.dev.restore(backup)
+        self.assertTrue(result.changed)
+        self.assertEqual(self.fake.settings, backup)
+        self.assertEqual(self.backups.load(result.backup), self.original)  # the state before is saved
+
+    def test_restore_still_checks_pump_and_fans(self):
+        pump_low = p.encode_settings(p.with_fan(p.decode_settings(self.original), 0, min_percent=10.0), self.original)
+        with self.assertRaises(ValidationError) as cm:
+            self.dev.restore(pump_low)
+        self.assertIn("Minimum", str(cm.exception))
+        self.assertEqual(self.fake.writes, [])
+
+    def test_restore_with_pump_low_and_other_led_bytes_is_rejected(self):
+        low = p.encode_settings(p.with_fan(p.decode_settings(self.original), 0, min_percent=10.0), self.original)
+        both = bytearray(low)
+        both[397 + 26:397 + 28] = (40).to_bytes(2, "big")
+        both[959:961] = p.crc16_usb(bytes(both[1:959])).to_bytes(2, "big")
+        with self.assertRaises(ValidationError):
+            self.dev.restore(bytes(both))
+        self.assertEqual(self.fake.writes, [])
+
+    def test_restore_still_checks_other_fields(self):
+        pid = p.with_controller(p.decode_settings(self.original), 1, pid=(1, 2, 3, 4, 5, 6))
+        with self.assertRaises(ValidationError):
+            self.dev.restore(p.encode_settings(pid, self.original))
+
     def test_restore_rejects_corrupt_report(self):
         with self.assertRaises(ValueError):
             self.dev.restore(self.original[:-1])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from .backups import BackupStore
@@ -35,6 +35,14 @@ class ApplyResult:
 
 
 Check = Callable[[Settings, Settings], None]
+
+
+def _known_state(current: Settings, backup: Settings) -> Settings:
+    """`backup` as the validator should see it: a backup is a state the device was in, so LED entries, strip
+    brightness and flags, profile and sensor offsets may differ from now. Pump and fan settings are still
+    checked in full (minimum, fixed value, curves ...)."""
+    return replace(backup, leds=current.leds, strip_brightness=current.strip_brightness,
+                   strip_flags=current.strip_flags, profile=current.profile, temp_offsets=current.temp_offsets)
 
 
 class Device:
@@ -96,7 +104,8 @@ class Device:
         with self._lock:
             self._ensure_open()
             old_report = self._read_report()
-            self._check(decode_settings(old_report), decode_settings(report))
+            old = decode_settings(old_report)
+            self._check(old, _known_state(old, decode_settings(report)))
             if report == old_report:
                 return ApplyResult(changed=False)
             return self._write_verified(old_report, report, True, reason)
