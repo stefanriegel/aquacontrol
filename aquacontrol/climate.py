@@ -300,6 +300,7 @@ class ClimateController:
         self._confirm_until: float | None = None  # switched on, HA still says off: keep looking until then
         self._off_pending = False      # our turn_off failed: a later "off" is still our own doing
         self._next_poll = 0.0          # a foreign (manually running) AC is looked at again only from here on
+        self._probe_arming = False     # arming just started: look at the AC once right away (see _tick_unowned)
         self._switches: list[float] = []
         self._failures = 0
         self._ha_ok = self._ha_failed = False  # what Home Assistant did during the current tick
@@ -407,9 +408,9 @@ class ClimateController:
         return a[0] == b[0] and self._temp_close(a[1], b[1]) and self._preset_equal(a[2], b[2])
 
     def _reflects(self, st: dict, cfg: ClimateConfig) -> bool:
-        """HA shows a running AC with the configured temperature and preset."""
+        """HA shows the AC running in the configured mode with the configured temperature and preset."""
         state, temp, preset = self._fingerprint_of(st)
-        return (state not in ("off", None, *UNAVAILABLE) and self._temp_close(temp, cfg.ac.temperature)
+        return (state == cfg.ac.hvac_mode and self._temp_close(temp, cfg.ac.temperature)
                 and self._preset_equal(preset, cfg.ac.preset))
 
     def _take_ownership(self, now: float, st: dict, confirmed: bool) -> None:
@@ -441,7 +442,7 @@ class ClimateController:
                 self._event(now, "Automatik deaktiviert, Besitz abgegeben (die Klimaanlage bleibt unverändert)")
             self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
             self._last_seen = self._manual_off_until = self._confirm_until = None
-            self._off_pending = self._unconfirmed = False
+            self._off_pending = self._unconfirmed = self._probe_arming = False
             self._mismatches = 0
             self._failures, self._retry_at = 0, None
             self._state, self._reason = "disabled", "Automatik ist deaktiviert"
@@ -458,12 +459,14 @@ class ClimateController:
             self._off_since = None
             if on_met:
                 if self._arming_since is None:
-                    self._arming_since = now
-            else:  # the on-condition is interrupted: old observations are outdated, a manual-off pause is over
+                    self._arming_since, self._probe_arming = now, True
+            else:  # the on-condition is interrupted: what was seen of the AC is outdated
                 self._arming_since, self._next_poll, self._last_seen = None, 0.0, None
-                if self._manual_off_until is not None:
-                    self._manual_off_until = None
-                    self._event(now, "Wasser ist wieder kühler: die Pause nach dem Ausschalten von Hand ist beendet")
+            if (self._manual_off_until is not None and water is not None and water <= cfg.off.water_c):
+                # the pause waits for cool water, not for any interruption: the water must be cool again
+                self._manual_off_until = None
+                self._event(now, f"Wasser ist wieder kühl (≤ {_fmt_c(cfg.off.water_c)}): "
+                                 "die Pause nach dem Ausschalten von Hand ist beendet")
 
         client = self._client_factory()
         if client is None:
@@ -556,18 +559,18 @@ class ClimateController:
         self._reason = f"Handbetrieb übernommen, Sperrzeit noch {cfg.min_off_minutes} min"
 
     def _manual_off(self, now: float, cfg: ClimateConfig, what: str) -> None:
-        """A person switched the AC off: do not switch it on again until the on-condition has been interrupted once
-        (see _decide), or at the latest after the configured pause."""
+        """A person switched the AC off: do not switch it on again until the water was cool again (<= off.water_c on a
+        tick with valid data, see _decide), or at the latest after the configured pause."""
         self._manual_off_until = now + cfg.manual_off_pause_minutes * 60
         self._arming_since = None
         self._event(now, f"{what} – Automatik pausiert bis das Wasser wieder kühl ist "
                          f"(spätestens {self._clock_text(self._manual_off_until)})")
-        self._manual_off_status()
+        self._manual_off_status(cfg)
 
-    def _manual_off_status(self) -> None:
+    def _manual_off_status(self, cfg: ClimateConfig) -> None:
         self._state = "cooldown"
         self._reason = ("Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist "
-                        f"(spätestens {self._clock_text(self._manual_off_until)})")
+                        f"(≤ {_fmt_c(cfg.off.water_c)}, spätestens {self._clock_text(self._manual_off_until)})")
 
     @staticmethod
     def _clock_text(epoch: float) -> str:
@@ -596,14 +599,18 @@ class ClimateController:
         self._reason = f"Sperrzeit nach dem Ausschalten: noch {cfg.min_off_minutes} min"
 
     def _tick_unowned(self, now: float, cfg: ClimateConfig, client, water: float | None, why_not: str) -> None:
+        probe, self._probe_arming = self._probe_arming, False
         if self._manual_off_until is not None:
             if now < self._manual_off_until:
-                self._manual_off_status()
+                self._probe_arming = False
+                self._manual_off_status(cfg)
                 return
             self._manual_off_until = None
             self._event(now, f"Pause nach dem Ausschalten von Hand abgelaufen ({cfg.manual_off_pause_minutes} min)")
         self._recheck_confirmation(now, cfg, client)
         if self._owned_since is not None:  # it showed the configured values after all
+            return
+        if probe and self._probe(now, cfg, client):
             return
         if now < self._cooldown_until:
             self._state = "cooldown"
@@ -648,6 +655,24 @@ class ClimateController:
                             f"Klimaanlage läuft bereits (Handbetrieb, Zustand {state}), aquacontrol schaltet nichts")
             return
         self._turn_on(now, cfg, client, water)
+
+    def _probe(self, now: float, cfg: ClimateConfig, client) -> bool:
+        """One look at the AC when arming starts, so that a manually running AC is known before the arming time is
+        over: a person who switches it off during arming, the lockout or the switch limit is then noticed as a manual
+        OFF. Returns True when that was the case (the pause has started)."""
+        if self._backing_off(now):
+            return False
+        st = self._read(now, client, cfg.entity_id)
+        if st is None:
+            return False
+        state = st.get("state")
+        seen, self._last_seen = self._last_seen, state
+        if state == "off" and seen is not None and seen != "off" and seen not in UNAVAILABLE:
+            self._manual_off(now, cfg, "Klimaanlage wurde von Hand ausgeschaltet")
+            return True
+        if state != "off":
+            self._next_poll = now + cfg.on.minutes * 60  # the regular look at the end of arming is not skipped
+        return False
 
     def _turn_on(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
         ac, e = cfg.ac, cfg.entity_id

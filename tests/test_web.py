@@ -634,6 +634,38 @@ class WebTest(unittest.TestCase):
         self.assertEqual(body["config"]["ha_url"], "http://elsewhere.example:8123")
         self.assertNotIn("notice", self.req("GET", "/api/climate")[1])
 
+    def test_the_stored_token_is_deleted_before_the_new_url_is_written(self):
+        """No moment where the new address and the old token coexist (N2 of the re-review)."""
+        self.configure_ha()
+        seen = []
+        real = self.config._store_climate
+
+        def spy(cfg):
+            seen.append((cfg.ha_url, Path(self.tmp.name, "secrets.json").read_text()))
+            return real(cfg)
+
+        with mock.patch.object(self.config, "_store_climate", spy):
+            status, body = self.req("PUT", "/api/climate", {"ha_url": "http://elsewhere.example:8123"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "http://elsewhere.example:8123")
+        self.assertNotIn(self.TOKEN, seen[0][1])
+        self.assertNotIn("ha_token", seen[0][1])
+
+    def test_the_old_token_is_gone_before_the_new_url_is_written_even_with_a_new_token(self):
+        self.configure_ha()
+        seen = []
+        real = self.config._store_climate
+
+        def spy(cfg):
+            seen.append(self.config.secrets.get_ha_token())
+            return real(cfg)
+
+        with mock.patch.object(self.config, "_store_climate", spy):
+            self.req("PUT", "/api/climate", {"ha_url": "http://elsewhere.example:8123", "token": "new.token.value"})
+        self.assertEqual(seen, [""])
+        self.assertEqual(self.config.secrets.get_ha_token(), "new.token.value")
+
     def test_unchanged_or_equivalent_url_keeps_the_token(self):
         self.configure_ha()
         for body in ({"ha_url": "http://ha.example:8123"}, {"ha_url": "http://ha.example:8123/"}, {"enabled": True},

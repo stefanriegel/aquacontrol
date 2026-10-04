@@ -54,9 +54,10 @@ deaktiviert** (`enabled: false`, keine HA-Adresse). Details: `docs/superpowers/s
   Preset (zwei Abfragen hintereinander mit Abweichung; Temperatur ±0,25 °C, Preset ohne Groß-/Kleinschreibung), gibt
   aquacontrol den Besitz ab und schaltet nichts mehr. Nach einem Daemon-Neustart gilt eine laufende Klimaanlage als fremd.
 - **Von Hand ausgeschaltet:** Schaltet jemand die Klimaanlage aus (eine eigene oder eine, die aquacontrol laufen sah),
-  schaltet die Automatik **nicht** wieder ein, solange die Einschalt-Bedingung ununterbrochen gilt. Die Pause endet,
-  sobald das Wasser unter die Einschalt-Temperatur fällt, ein Lüfter darunter liegt oder die Temperatur unbekannt ist,
-  spätestens nach `manual_off_pause_minutes` (Standard 120, einstellbar 10 bis 480).
+  pausiert die Automatik, bis das Wasser wieder kühl ist: Die Pause endet, sobald die Wassertemperatur in einem
+  Durchlauf mit gültigen Daten höchstens `off.water_c` (Abkühlschwelle, Standard 36 °C) beträgt, spätestens nach
+  `manual_off_pause_minutes` (Standard 120, einstellbar 10 bis 480). Eine bloße Unterbrechung der Einschalt-Bedingung
+  (Wasser zwischen 36 und 40 °C) beendet sie nicht.
 - **Einschalten bestätigen:** Nach dem Einschalten wartet aquacontrol bis zu 10 s, bis Home Assistant die gesetzten
   Werte zeigt (die Cloud ist verzögert). Zeigt sie sie nicht, gilt das Einschalten als „unbestätigt“ und wird in den
   nächsten Zyklen erneut geprüft.

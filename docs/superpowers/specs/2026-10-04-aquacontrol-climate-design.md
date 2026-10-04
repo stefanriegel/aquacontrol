@@ -54,7 +54,7 @@ Alle Werte sind konfigurierbar. Danach liest aquacontrol den Zustand und merkt s
 gesetzt hat: hvac-Zustand, Zieltemperatur, Preset. Ab dann gilt **Besitz = aquacontrol**.
 
 Die Cloud-Integration zeigt das Ergebnis eines Service-Aufrufs erst nach etwa 0,5 s. Deshalb fragt aquacontrol den Zustand
-alle 0,5 s ab, höchstens 10 s lang, bis er einen laufenden Zustand mit der eingestellten Temperatur (±0,25 °C) und dem
+alle 0,5 s ab, höchstens 10 s lang, bis er die eingestellte Betriebsart (`ac.hvac_mode`) mit der eingestellten Temperatur (±0,25 °C) und dem
 Preset (ohne Groß-/Kleinschreibung) zeigt, und nimmt den Fingerabdruck aus dieser Abfrage. Zeigt HA bis dahin einen
 laufenden Zustand mit anderen Werten, gilt der Besitz mit dem letzten Stand als „unbestätigt“; sobald die eingestellten
 Werte erscheinen, ist er bestätigt. Zeigt HA noch `off`, ist die Anlage nicht im Besitz, wird aber in den folgenden Zyklen
@@ -72,9 +72,11 @@ Solange aquacontrol im Besitz ist, wird bei jedem Zyklus geprüft:
 Beobachtet aquacontrol einen Wechsel auf `off`, den es nicht selbst verursacht hat, schaltet es **nicht wieder ein**, solange
 die Einschalt-Bedingung ununterbrochen gilt. Das gilt für eine eigene Anlage (Besitzabgabe mit Zustand `off`) und für eine
 fremde, die aquacontrol laufen sah und die jetzt `off` ist (`unavailable`/`unknown` davor zählt nicht). Status `cooldown`,
-Grund „Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (spätestens HH:MM)“.
-- Die Pause endet, sobald die Einschalt-Bedingung einmal unterbrochen ist (Wasser < `on.water_c`, ein Lüfter unter
-  `on.fan_percent`, Wasser unbekannt oder QUADRO offline). Danach gilt das normale Einschalten mit voller `on.minutes`.
+Grund „Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (≤ 36.0 °C, spätestens HH:MM)“.
+- Die Pause endet erst, wenn das Wasser wieder kühl ist: Wassertemperatur ≤ `off.water_c` (Abkühlschwelle, Standard 36 °C)
+  in einem Durchlauf mit gültigen Daten. Eine bloße Unterbrechung der Einschalt-Bedingung (Wasser zwischen 36 und 40 °C,
+  ein Lüfter langsamer, Wasser unbekannt, QUADRO offline) beendet sie nicht. Danach gilt das normale Einschalten mit voller
+  `on.minutes`.
 - Obergrenze: `manual_off_pause_minutes` (Standard 120, 10–480).
 - Lamellen-Selects zählen nicht zum Fingerabdruck. Die Cloud meldet sie teils verzögert oder anders zurück.
 
@@ -102,7 +104,9 @@ Aktion: `climate.turn_off`. Danach ist der Besitz beendet, und die Sperrzeit beg
 Die Zustandsmaschine läuft alle 30 s in einem eigenen Thread mit injizierbarer Uhr. Die HA-Abfrage geschieht nur, wenn sie
 für eine Entscheidung gebraucht wird:
 - im Besitz in jedem Zyklus
-- sonst nur, wenn die Einschaltbedingungen erfüllt sind
+- sonst nur, wenn die Einschaltbedingungen erfüllt sind: einmal sofort, wenn das Warten beginnt (damit eine von Hand laufende
+  Anlage bekannt ist und ihr Ausschalten während des Wartens, der Sperrzeit oder des Schaltlimits auffällt), dann wieder nach
+  Ablauf von `on.minutes`
 
 ## 4. Konfiguration
 
@@ -152,7 +156,8 @@ für eine Entscheidung gebraucht wird:
   - die letzten 20 Ereignisse
 - `PUT /api/climate`: Teil-Update der Konfiguration. Das optionale `"token"` wird in secrets geschrieben, `""` löscht es. Ein
   Ändern der Konfiguration setzt Besitz und Zeiten **nicht** zurück. Ändert sich `ha_url` ohne neues `token` in derselben
-  Anfrage, wird das gespeicherte Token gelöscht (Antwort: `token_set: false` und ein deutscher `notice`).
+  Anfrage, wird das gespeicherte Token gelöscht (Antwort: `token_set: false` und ein deutscher `notice`). Das Token wird
+  gelöscht, bevor die neue Adresse gespeichert wird.
 - `POST /api/climate/test`: liest die Entity und beide Lamellen-Selects über HA. Antwort (flach):
   `{"ok", "state", "temperature", "preset", "fan_mode", "horizontal", "vertical"}` oder ein Fehler. Dabei wird nichts geschaltet.
 - `GET /api/climate/options`: liest `/api/states` und liefert `hvac_modes` (nur cool/dry/fan_only), `preset_modes`, `fan_modes`,

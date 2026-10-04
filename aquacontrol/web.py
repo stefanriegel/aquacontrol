@@ -23,7 +23,7 @@ from .auth import token_source, verify_password
 from .backups import BackupError, BackupStore
 from .colors import hex_to_hsv1536, hsv1536_to_hex
 from .climate import (FAN_MODES, HORIZONTAL, HVAC_MODES, PRESETS, VERTICAL, ClimateConfigError, ClimateController,
-                      _entity as parse_entity)
+                      _entity as parse_entity, merge_climate, parse_climate_config)
 from .config import AppConfig, Secrets
 from .device import Device, DeviceError
 from .ha import HAError
@@ -382,14 +382,18 @@ class App:
             raise NotFound()
         patch = dict(body)
         token = Secrets.clean_token(patch.pop("token")) if "token" in patch else None  # validate before any write
-        old_url = self.config.climate_config().ha_url
-        if patch:
-            self.config.patch_climate(patch)
         notice = None
-        if token is None and self.config.climate_config().ha_url != old_url and self.config.secrets.get_ha_token():
-            # The stored token must never be sent to another address than the one it was entered for.
-            token = ""
-            notice = "Adresse geändert: das gespeicherte Token wurde gelöscht, bitte neu eingeben"
+        if patch:
+            current = self.config.climate_config()
+            # normalised new address, validated before anything is written (ClimateConfigError -> 400)
+            new_url = parse_climate_config(merge_climate(current.to_json(), patch)).ha_url
+            if new_url != current.ha_url and self.config.secrets.get_ha_token():
+                # The stored token must never be sent to another address than the one it was entered for, not even
+                # for a moment: delete it BEFORE the new address is persisted.
+                self.config.secrets.set_ha_token("")
+                if token is None:
+                    notice = "Adresse geändert: das gespeicherte Token wurde gelöscht, bitte neu eingeben"
+            self.config.patch_climate(patch)
         if token is not None:
             self.config.secrets.set_ha_token(token)  # "" removes it
         out = self.climate_json()

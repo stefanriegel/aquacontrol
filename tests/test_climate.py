@@ -248,17 +248,27 @@ class TurnOnTest(unittest.TestCase):
         r.advance(30)
         self.assertEqual(r.client.log, [])
 
-    def test_no_ha_traffic_while_arming(self):
+    def test_ha_is_read_once_when_arming_starts_and_not_again_while_arming(self):
         r = Rig()
         r.tick()
-        r.advance(4)
-        self.assertEqual(r.client.log, [])
+        self.assertEqual(r.client.log, [("get", E)])
+        r.advance(4.5)
+        self.assertEqual(r.client.log, [("get", E)])
 
     def test_ha_state_is_read_before_switching_on(self):
         r = Rig()
         r.tick()
         r.advance(5)
-        self.assertEqual(r.client.log[0], ("get", E))
+        self.assertEqual(r.client.log[:2], [("get", E), ("get", E)])
+        self.assertEqual(r.client.calls, ON_CALLS)
+        self.assertEqual(r.client.log[1], ("get", E))     # the second read precedes the first service call
+        self.assertEqual([k for k, *_ in r.client.log[:3]], ["get", "get", "call"])
+
+    def test_no_read_at_all_when_arming_never_starts(self):
+        r = Rig()
+        r.snapshot = cool(37.0)
+        r.advance(10)
+        self.assertEqual(r.client.log, [])
 
     def test_manual_running_ac_is_left_alone(self):
         for running in ("cool", "heat", "fan_only", "dry", "heat_cool"):
@@ -291,6 +301,66 @@ class TurnOnTest(unittest.TestCase):
         r.advance(1)
         r.set(hot())
         r.advance(5.5)                                   # nobody switched it off while the water was hot
+        self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_person_switching_off_a_foreign_ac_during_arming_is_noticed(self):
+        """Verified scenario of the re-review (O2): ON came 2 min later, at the end of arming."""
+        r = Rig()
+        r.client.ac("cool")
+        r.tick()                                         # arming starts, the running AC is seen
+        r.advance(2)
+        r.client.ac("off")                               # a person switches it off
+        r.advance(10)
+        self.assertEqual(r.client.calls, [])
+        self.assertEqual(r.state(), "cooldown")
+        self.assertIsNotNone(r.status()["manual_off_until"])
+        self.assertIn("von Hand ausgeschaltet", r.status()["events"][0]["message"])
+
+    def test_person_switching_off_a_foreign_ac_during_the_lockout_is_noticed(self):
+        r = Rig()
+        r.ctrl._cooldown_until = r.now + 10 * MIN         # a lockout that outlasts the arming time
+        r.client.ac("cool")
+        r.tick()
+        r.advance(2)
+        r.client.ac("off")
+        r.advance(15)
+        self.assertEqual(r.client.calls, [])
+        self.assertIsNotNone(r.status()["manual_off_until"])
+
+    def test_person_switching_off_a_foreign_ac_while_the_switch_limit_is_reached_is_noticed(self):
+        r = Rig(max_switches_per_hour=1)
+        r.ctrl._switches = [r.now - 10 * MIN]
+        r.client.ac("cool")
+        r.tick()
+        r.advance(2)
+        r.client.ac("off")
+        r.advance(60)
+        self.assertEqual(r.client.calls, [])
+        self.assertIsNotNone(r.status()["manual_off_until"])
+
+    def test_the_arming_start_read_is_bounded(self):
+        r = Rig()
+        r.client.ac("cool")
+        r.tick()
+        r.advance(4.5)
+        self.assertEqual(len(r.client.gets), 1)           # one read per arming start, not one per cycle
+        r.advance(0.5)
+        self.assertEqual(len(r.client.gets), 2)           # and the usual read at the end of arming
+        r.advance(30)
+        self.assertEqual(len(r.client.gets), 2 + 6)       # then one per on.minutes while it keeps running
+        r.set(cool())
+        r.set(hot())                                      # a new arming start reads once more
+        self.assertEqual(len(r.client.gets), 2 + 6 + 1)
+
+    def test_a_failing_arming_start_read_backs_off_and_does_not_block_switching_on(self):
+        r = Rig()
+        r.client.failing = {"get"}
+        r.tick()
+        self.assertEqual(r.client.gets, [E])
+        r.advance(0.9)
+        self.assertEqual(len(r.client.gets), 1)           # backoff
+        r.client.failing = set()
+        r.advance(5)
         self.assertEqual(r.client.calls, ON_CALLS)
 
     def test_manual_ac_is_not_polled_every_cycle(self):
@@ -554,7 +624,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         r.client.log.clear()
         r.set(hot())
         r.advance(14.5)
-        self.assertEqual(r.client.log, [])
+        self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         self.assertEqual(r.state(), "cooldown")
         self.assertIsNotNone(r.status()["cooldown_until"])
         r.advance(0.5)
@@ -567,7 +637,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         r.client.log.clear()
         r.set(hot())
         r.advance(19.5)
-        self.assertEqual(r.client.log, [])
+        self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         r.advance(0.5)
         self.assertEqual(r.client.calls, ON_CALLS)
 
@@ -579,12 +649,12 @@ class LockoutAndLimitTest(unittest.TestCase):
         r.client.log.clear()
         r.set(hot())
         r.advance(15)                              # lockout (15 min) is over, limit is not
-        self.assertEqual(r.client.log, [])
+        self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         self.assertEqual(r.state(), "idle")
         self.assertIn("Schaltlimit", r.status()["reason"])
         r.now = t_on + 3600 - 1
         r.tick()
-        self.assertEqual(r.client.log, [])
+        self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         r.now = t_on + 3600 + 1
         r.tick()
         self.assertEqual(r.client.calls, ON_CALLS)
@@ -631,6 +701,7 @@ class ErrorTest(unittest.TestCase):
     def test_backoff_one_five_fifteen_minutes(self):
         r = Rig()
         r.tick()
+        r.client.log.clear()                            # the look at the start of arming is not under test
         r.advance(4.5)
         r.client.failing = {"get"}
         r.advance(0.5)                                  # first attempt, fails
@@ -867,6 +938,36 @@ class ReadBackTest(unittest.TestCase):
         r.advance(60)
         self.assertEqual(r.client.count("climate", "turn_off"), 0)
 
+    def test_unconfirmed_ac_switched_to_another_mode_by_a_person_is_handed_over_not_confirmed(self):
+        r = Rig()
+        r.client.lag, r.client.lag_services = 1000, {"set_temperature", "set_preset_mode"}
+        r.tick()
+        r.advance(5)
+        self.assertTrue(r.status()["unconfirmed"])       # HA shows cool, 24 deg, Normal
+        r.client.lag = 0
+        r.client.ac("heat", temperature=20.0, preset_mode="Quiet")   # a person: other mode, same temperature/preset
+        r.advance(1.5)
+        st = r.status()
+        self.assertIsNone(st["owned_since"])
+        self.assertEqual(st["state"], "cooldown")
+        self.assertNotIn("bestätigt", " ".join(e["message"] for e in st["events"] if "unbestätigt" not in e["message"]))
+        self.assertIn("Handbetrieb übernommen", st["events"][0]["message"])
+        r.snapshot = cool()
+        r.advance(60)
+        self.assertEqual(r.client.count("climate", "turn_off"), 0)
+
+    def test_a_late_switch_on_in_another_mode_is_not_taken_over(self):
+        r = Rig()
+        r.client.ignore_on = True
+        r.tick()
+        r.advance(5)
+        r.client.ac("heat", temperature=20.0, preset_mode="Quiet")   # a person's remote, same numbers
+        r.advance(3)
+        self.assertIsNone(r.status()["owned_since"])
+        r.snapshot = cool()
+        r.advance(60)
+        self.assertEqual(r.client.count("climate", "turn_off"), 0)
+
     def test_confirmation_window_ends(self):
         r = Rig()
         r.client.ignore_on = True
@@ -984,9 +1085,9 @@ class ManualOffTest(unittest.TestCase):
     def assert_paused(self, r):
         st = r.status()
         self.assertEqual(st["state"], "cooldown")
-        self.assertIn("Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (spätestens ",
-                      st["reason"])
-        self.assertRegex(st["reason"], r"\(spätestens \d\d:\d\d\)$")
+        self.assertIn("Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (≤ 36.0 °C, "
+                      "spätestens ", st["reason"])
+        self.assertRegex(st["reason"], r"spätestens \d\d:\d\d\)$")
         self.assertIsNotNone(st["manual_off_until"])
         self.assertEqual(r.client.count("climate", "set_hvac_mode"), 0)
 
@@ -1005,29 +1106,68 @@ class ManualOffTest(unittest.TestCase):
         self.assertEqual(r.client.calls, [])
         self.assert_paused(r)
 
-    def test_pause_ends_when_the_condition_is_interrupted_and_arms_again(self):
+    def test_pause_ends_when_the_water_is_cool_again_and_arms_from_scratch(self):
         for make in (self.owned_then_off_by_hand, self.foreign_then_off_by_hand):
             with self.subTest(make=make.__name__):
                 r = make(min_off_minutes=1)
                 r.advance(20)
                 self.assertEqual(r.client.calls, [])
-                r.set(cool())
+                r.set(cool(36.0))                        # the cool-down threshold itself is enough
                 self.assertIsNone(r.status()["manual_off_until"])
+                self.assertIn("kühl", r.status()["events"][0]["message"])
                 r.set(hot())
                 r.advance(4.5)
                 self.assertEqual(r.client.calls, [])     # arming again takes the full on-time
                 r.advance(1)
                 self.assertEqual(r.client.calls, ON_CALLS)
 
-    def test_any_interruption_ends_the_pause(self):
-        for name, interrupt in (("water below", snap(39.0, (30.0, 90.0, 90.0, 30.0))),
+    def test_owned_ac_switched_off_at_38_degrees_stays_off_until_the_water_was_cool(self):
+        """Verified scenario of the re-review (O1): water between 36 and 40 deg must not end the pause."""
+        r = Rig(min_off_minutes=1, max_switches_per_hour=10)
+        r.bring_on()
+        r.set(snap(38.0, (30.0, 90.0, 90.0, 30.0)))
+        r.client.ac("off")                               # a person switches it off
+        r.advance(1)
+        self.assert_paused(r)
+        r.advance(10)                                    # still 38 deg: the on-condition is interrupted, no cool-down
+        self.assert_paused(r)
+        r.set(snap(40.0, (30.0, 90.0, 90.0, 30.0)))      # climbs back to 40 deg and stays there
+        r.advance(15)
+        self.assertEqual(r.client.calls, [])
+        r.set(snap(36.5, (30.0, 90.0, 90.0, 30.0)))      # not yet cool
+        r.advance(2)
+        r.set(hot())
+        r.advance(15)
+        self.assertEqual(r.client.calls, [])
+        self.assert_paused(r)
+        r.set(cool(36.0))                                # now it was cool
+        self.assertIsNone(r.status()["manual_off_until"])
+        r.set(hot())
+        r.advance(5.5)
+        self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_the_pause_survives_interruptions_without_a_cool_reading(self):
+        for name, interrupt in (("water below on-threshold", snap(39.0, (30.0, 90.0, 90.0, 30.0))),
                                 ("fan below", snap(45.0, (30.0, 84.0, 90.0, 30.0))),
                                 ("water unknown", snap(None, (30.0, 90.0, 90.0, 30.0))),
                                 ("offline", hot(online=False))):
-            with self.subTest(name):
-                r = self.owned_then_off_by_hand(min_off_minutes=1)
-                r.set(interrupt)
-                self.assertIsNone(r.status()["manual_off_until"])
+            for make in (self.owned_then_off_by_hand, self.foreign_then_off_by_hand):
+                with self.subTest(name, make=make.__name__):
+                    r = make(min_off_minutes=1)
+                    r.set(interrupt)
+                    r.advance(2)
+                    self.assertIsNotNone(r.status()["manual_off_until"])
+                    r.set(hot())
+                    r.advance(10)
+                    self.assertEqual(r.client.calls, [])
+                    self.assert_paused(r)
+
+    def test_the_cool_threshold_is_the_configured_off_water_temperature(self):
+        r = self.owned_then_off_by_hand(off={"water_c": 33.0, "minutes": 10})
+        r.set(cool(34.0))
+        self.assertIsNotNone(r.status()["manual_off_until"])
+        r.set(cool(33.0))
+        self.assertIsNone(r.status()["manual_off_until"])
 
     def test_ceiling_ends_the_pause_even_while_the_condition_persists(self):
         for make in (self.owned_then_off_by_hand, self.foreign_then_off_by_hand):
