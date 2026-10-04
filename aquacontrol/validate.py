@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 from typing import Callable
 
-from .protocol import MODE_CURVE, MODE_FIXED, MODE_TARGET, STRIP_FLAG_DISABLED, Settings
+from .protocol import (LED_EDITABLE_FLAGS, LED_MAX_THRESHOLDS, LED_MODE_COLOR_SWITCH, LED_MODE_STATIC, MODE_CURVE,
+                       MODE_FIXED, MODE_TARGET, NUM_TEMPS, STRIP_FLAG_DISABLED, LedController, Settings)
 
 EDITABLE_MODES = (MODE_FIXED, MODE_TARGET, MODE_CURVE)
 CURVE_SENSORS = (0, 1, 2, 3)
 TARGET_RANGE_C = (20.0, 60.0)
 CURVE_TEMP_RANGE_C = (0.0, 100.0)
+LED_SOURCES = tuple(range(NUM_TEMPS))  # temperature sensors 1-4; same unit as the stored binding range
+MAX_HUE = 1535
 
 
 class ValidationError(ValueError):
@@ -28,6 +31,74 @@ def _percent(value: float, what: str) -> None:
         raise ValidationError(f"{what}: {value} % liegt nicht zwischen 0 und 100")
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_colour(name: str, colour: tuple) -> None:
+    if len(colour) != 3:
+        raise ValidationError(f"{name}: Farbe braucht Farbton, Sättigung und Helligkeit")
+    h, s, v = colour
+    if not _is_int(h) or not 0 <= h <= MAX_HUE:
+        raise ValidationError(f"{name}: Farbton {h!r} nicht in 0–{MAX_HUE}")
+    if not _is_int(s) or not 0 <= s <= 255:
+        raise ValidationError(f"{name}: Sättigung {s!r} nicht in 0–255")
+    if not _is_int(v) or not 0 <= v <= 255:
+        raise ValidationError(f"{name}: Helligkeit {v!r} nicht in 0–255")
+
+
+def _check_led(number: int, old: LedController, new: LedController) -> None:
+    """Only a Farbschalter (thresholds, colours, flags, source) and a static colour (colour, flags) may change."""
+    if (old.flags, old.source, old.values, old.palette) == (new.flags, new.source, new.values, new.palette) and \
+            (old.led_start, old.led_count, old.mode, old.binding1) == (new.led_start, new.led_count, new.mode, new.binding1):
+        return
+    name = f"LED-Controller {number}"
+    if old.mode not in (LED_MODE_COLOR_SWITCH, LED_MODE_STATIC):
+        raise ValidationError(f"{name}: nicht änderbar (nur Farbschalter und statische Farbe)")
+    if (new.led_start, new.led_count, new.mode, new.binding1) != (old.led_start, old.led_count, old.mode, old.binding1):
+        raise ValidationError(f"{name}: LED-Bereich, Modus und Wertebereich sind nicht änderbar")
+    if (new.flags ^ old.flags) & ~LED_EDITABLE_FLAGS:
+        raise ValidationError(f"{name}: nur die Schalter Überblenden, Blinken und Helligkeit nach Datenquelle sind änderbar")
+    if new.source != old.source:
+        if old.mode == LED_MODE_STATIC:
+            raise ValidationError(f"{name}: eine statische Farbe hat keine Datenquelle")
+        if not _is_int(new.source) or new.source not in LED_SOURCES:
+            raise ValidationError(f"{name}: Datenquelle {new.source!r} ist nicht wählbar (nur Temperatursensor 1–4)")
+    if len(new.values) != len(old.values) or len(new.palette) != len(old.palette):
+        raise ValidationError(f"{name}: Effektwerte und Palette haben eine feste Länge")
+    if old.mode == LED_MODE_STATIC:
+        if new.values != old.values:
+            raise ValidationError(f"{name}: eine statische Farbe hat keine Schwellen")
+        if new.palette[1:] != old.palette[1:]:
+            raise ValidationError(f"{name}: Palette: nur die Farbe ist änderbar")
+        if new.palette[0] != old.palette[0]:
+            _check_colour(name, new.palette[0])
+        return
+    n = new.values[0]
+    if not _is_int(n) or not 1 <= n <= LED_MAX_THRESHOLDS:
+        raise ValidationError(f"{name}: Anzahl der Schwellen {n!r} nicht in 1 bis {LED_MAX_THRESHOLDS}")
+    old_n = old.values[0]
+    free = range(2 + n, len(new.values))
+    if new.values[1] != old.values[1] or any(new.values[k] != old.values[k] for k in free):
+        raise ValidationError(f"{name}: andere Effektwerte sind nicht änderbar")
+    if new.values[:2 + n] != old.values[:2 + n]:
+        thresholds = new.values[2:2 + n]
+        if not all(_is_int(t) for t in thresholds):
+            raise ValidationError(f"{name}: Schwellen müssen ganze Zahlen sein")
+        if any(b <= a for a, b in zip(thresholds, thresholds[1:])):
+            raise ValidationError(f"{name}: Schwellen müssen streng steigen")
+        x1, x2 = old.binding1[:2]
+        if any(not x1 <= t <= x2 for t in thresholds):
+            raise ValidationError(f"{name}: Schwellen müssen zwischen {x1} und {x2} liegen")
+    used = n + 1
+    if new.palette[used:] != old.palette[used:]:
+        raise ValidationError(f"{name}: Palette: nur die verwendeten Farben sind änderbar")
+    grown = range(max(old_n, 0) + 1, used)  # colours added by growing are copies of the last one
+    for k in range(used):
+        if new.palette[k] != old.palette[k] or k in grown:
+            _check_colour(name, new.palette[k])
+
+
 def check(old: Settings, new: Settings, min_percent: dict[int, float]) -> None:
     """Raise ValidationError if `new` is not an acceptable successor of `old`.
 
@@ -36,8 +107,10 @@ def check(old: Settings, new: Settings, min_percent: dict[int, float]) -> None:
     """
     if new.temp_offsets != old.temp_offsets:
         raise ValidationError("Sensor-Offsets sind nicht änderbar")
-    if new.leds != old.leds:
-        raise ValidationError("LED-Controller sind in dieser Version nicht änderbar")
+    if len(new.leds) != len(old.leds):
+        raise ValidationError("Anzahl der LED-Controller ist nicht änderbar")
+    for i, (ol, nl) in enumerate(zip(old.leds, new.leds)):
+        _check_led(i + 1, ol, nl)
     if new.profile != old.profile:
         raise ValidationError("Profilnummer ist nicht änderbar")
 

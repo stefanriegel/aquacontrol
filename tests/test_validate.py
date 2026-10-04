@@ -85,5 +85,104 @@ class ValidateTest(unittest.TestCase):
         self.bad(replace(self.old, profile=2), "Profilnummer")
 
 
+class ValidateLedTest(unittest.TestCase):
+    """LED rules (spec 2/3): C1 is a Farbschalter on source 0 (range 20-70, thresholds 35/45), C2 a static colour."""
+
+    def setUp(self):
+        self.old = p.decode_settings(load("settings_live.bin"))
+
+    def ok(self, new, old=None):
+        check(old or self.old, new, PUMP_FLOOR)
+
+    def bad(self, new, fragment, old=None):
+        with self.assertRaises(ValidationError) as cm:
+            check(old or self.old, new, PUMP_FLOOR)
+        self.assertIn(fragment, str(cm.exception))
+
+    def led(self, index=0, **changes):
+        return p.with_led(self.old, index, **changes)
+
+    def test_thresholds(self):
+        self.ok(self.led(thresholds=(38, 45)))
+        self.ok(self.led(thresholds=(20, 70)))  # the range limits themselves are fine
+        self.bad(self.led(thresholds=(45, 45)), "streng steigen")
+        self.bad(self.led(thresholds=(46, 45)), "streng steigen")
+        self.bad(self.led(thresholds=(19, 45)), "zwischen 20 und 70")
+        self.bad(self.led(thresholds=(35, 71)), "zwischen 20 und 70")
+        self.bad(self.led(thresholds=(35.5, 45)), "ganze Zahl")
+        self.bad(self.led(thresholds=(True, 45)), "ganze Zahl")
+
+    def test_threshold_count_is_1_to_5(self):
+        self.ok(self.led(thresholds=(40,)))
+        self.ok(self.led(thresholds=(25, 30, 40, 50, 60)))
+        self.bad(self.led(thresholds=()), "1 bis 5")
+        self.bad(self.led(thresholds=(21, 22, 23, 24, 25, 26)), "1 bis 5")
+
+    def test_growing_without_new_colour_copies_the_last_one(self):
+        self.ok(self.led(thresholds=(35, 45, 55)))
+
+    def test_colours(self):
+        self.ok(self.led(colors=((0x03ff, 255, 255), (255, 255, 255), (0, 255, 255))))
+        self.ok(self.led(colors=((1535, 0, 0), (255, 255, 255), (0, 255, 255))))
+        self.bad(self.led(colors=((1536, 255, 255), (255, 255, 255), (0, 255, 255))), "Farbton")
+        self.bad(self.led(colors=((-1, 255, 255), (255, 255, 255), (0, 255, 255))), "Farbton")
+        self.bad(self.led(colors=((0, 256, 255), (255, 255, 255), (0, 255, 255))), "Sättigung")
+        self.bad(self.led(colors=((0, 255, 300), (255, 255, 255), (0, 255, 255))), "Helligkeit")
+        self.bad(self.led(colors=((0.5, 255, 255), (255, 255, 255), (0, 255, 255))), "Farbton")
+
+    def test_colours_beyond_the_used_ones_are_not_changeable(self):
+        palette = self.old.leds[0].palette[:3] + ((1, 2, 3),) + self.old.leds[0].palette[4:]
+        self.bad(self.led(palette=palette), "Palette")
+
+    def test_flags(self):
+        self.ok(self.led(flags=0x0001))
+        self.ok(self.led(flags=0x0003 | 0x4000))
+        self.bad(self.led(flags=0x0004), "Schalter")
+        self.bad(self.led(flags=0x8000), "Schalter")
+
+    def test_source(self):
+        self.ok(self.led(source=3))
+        self.bad(self.led(source=4), "Datenquelle")  # flow
+        self.bad(self.led(source=-1), "Datenquelle")
+        self.bad(self.led(source=True), "Datenquelle")
+
+    def test_display_only_source_stays_as_it_is(self):
+        old = p.with_led(self.old, 0, source=4)
+        self.ok(p.with_led(old, 0, thresholds=(38, 45)), old)
+        self.bad(p.with_led(old, 0, source=7), "Datenquelle", old)
+
+    def test_static_colour(self):
+        self.ok(self.led(1, colors=((0x03ff, 255, 255),)))
+        self.ok(self.led(1, flags=0x0002))
+        self.bad(self.led(1, colors=((2000, 255, 255),)), "Farbton")
+        self.bad(self.led(1, thresholds=(30,)), "statische")
+        self.bad(self.led(1, source=2), "statische")
+        self.bad(self.led(1, palette=self.old.leds[1].palette[:1] + ((9, 9, 9),) + self.old.leds[1].palette[2:]),
+                 "Palette")
+
+    def test_nothing_else_may_change(self):
+        for field, value in (("led_start", 3), ("led_count", 1), ("mode", 1), ("binding1", (0, 100, 0, 255))):
+            with self.subTest(field=field):
+                self.bad(self.led(**{field: value}), "nicht änderbar")
+        self.bad(self.led(values=(2, 5, 35, 45, 100, 100, 100, 70, 0, 0, 0, 0)), "nicht änderbar")  # values[1]
+        self.bad(self.led(values=(2, 0, 35, 45, 100, 100, 100, 71, 0, 0, 0, 0)), "nicht änderbar")  # beyond n
+
+    def test_unused_controllers_are_immutable(self):
+        for i in range(2, 8):
+            with self.subTest(controller=i + 1):
+                self.bad(self.led(i, flags=0x0001), "nicht änderbar")
+                self.bad(self.led(i, colors=((0, 255, 255),)), "nicht änderbar")
+                self.bad(self.led(i, source=1), "nicht änderbar")
+
+    def test_unknown_modes_are_immutable(self):
+        old = p.with_led(self.old, 4, mode=0x20)
+        self.bad(p.with_led(old, 4, flags=1), "nicht änderbar", old)
+
+    def test_existing_odd_values_do_not_block_other_edits(self):
+        old = p.with_led(self.old, 0, values=(2, 0, 10, 99, 100, 100, 100, 70, 0, 0, 0, 0))
+        self.ok(p.with_led(old, 0, flags=1), old)  # thresholds outside the range stay as they are
+        self.bad(p.with_led(old, 0, thresholds=(10, 60)), "zwischen 20 und 70", old)
+
+
 if __name__ == "__main__":
     unittest.main()
