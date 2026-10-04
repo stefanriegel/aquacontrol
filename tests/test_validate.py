@@ -151,6 +151,22 @@ class ValidateLedTest(unittest.TestCase):
         self.ok(p.with_led(old, 0, thresholds=(38, 45)), old)
         self.bad(p.with_led(old, 0, source=7), "Datenquelle", old)
 
+    def test_source_can_only_change_when_the_current_one_is_a_temperature_sensor(self):
+        for old_source in (4, 5, -1):
+            with self.subTest(old_source=old_source):
+                old = p.with_led(self.old, 0, source=old_source)
+                self.bad(p.with_led(old, 0, source=0), "nur in der Aquasuite", old)
+                self.bad(p.with_led(old, 0, source=3), "nur in der Aquasuite", old)
+                self.ok(p.with_led(old, 0, source=old_source), old)  # unchanged is fine
+        self.ok(self.led(source=2))  # temperature -> other temperature
+
+    def test_static_colour_may_not_gain_brightness_by_source(self):
+        self.bad(self.led(1, flags=self.old.leds[1].flags | p.LED_FLAG_BRIGHTNESS), "Helligkeit nach Datenquelle")
+        old = p.with_led(self.old, 1, flags=self.old.leds[1].flags | p.LED_FLAG_BRIGHTNESS)
+        self.ok(p.with_led(old, 1, flags=old.leds[1].flags & ~p.LED_FLAG_BRIGHTNESS), old)  # can be switched off
+        self.ok(p.with_led(old, 1, colors=((1, 2, 3),)), old)  # stays set
+        self.ok(p.with_led(self.old, 1, flags=self.old.leds[1].flags | p.LED_FLAG_BLINK))
+
     def test_static_colour(self):
         self.ok(self.led(1, colors=((0x03ff, 255, 255),)))
         self.ok(self.led(1, flags=0x0002))

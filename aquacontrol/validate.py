@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 from typing import Callable
 
-from .protocol import (LED_EDITABLE_FLAGS, LED_MAX_THRESHOLDS, LED_MODE_COLOR_SWITCH, LED_MODE_STATIC, MODE_CURVE,
-                       MODE_FIXED, MODE_TARGET, NUM_TEMPS, STRIP_FLAG_DISABLED, LedController, Settings)
+from .protocol import (LED_EDITABLE_FLAGS, LED_FLAG_BRIGHTNESS, LED_MAX_THRESHOLDS, LED_MODE_COLOR_SWITCH,
+                       LED_MODE_STATIC, MODE_CURVE, MODE_FIXED, MODE_TARGET, NUM_TEMPS, STRIP_FLAG_DISABLED,
+                       LedController, Settings)
 
 EDITABLE_MODES = (MODE_FIXED, MODE_TARGET, MODE_CURVE)
 CURVE_SENSORS = (0, 1, 2, 3)
@@ -62,11 +63,15 @@ def _check_led(number: int, old: LedController, new: LedController) -> None:
     if new.source != old.source:
         if old.mode == LED_MODE_STATIC:
             raise ValidationError(f"{name}: eine statische Farbe hat keine Datenquelle")
+        if old.source not in LED_SOURCES:
+            raise ValidationError(f"{name}: Datenquelle nur in der Aquasuite änderbar (aktuelle Quelle ist kein Temperatursensor)")
         if not _is_int(new.source) or new.source not in LED_SOURCES:
             raise ValidationError(f"{name}: Datenquelle {new.source!r} ist nicht wählbar (nur Temperatursensor 1–4)")
     if len(new.values) != len(old.values) or len(new.palette) != len(old.palette):
         raise ValidationError(f"{name}: Effektwerte und Palette haben eine feste Länge")
     if old.mode == LED_MODE_STATIC:
+        if new.flags & LED_FLAG_BRIGHTNESS and not old.flags & LED_FLAG_BRIGHTNESS:
+            raise ValidationError(f"{name}: Helligkeit nach Datenquelle gibt es bei einer statischen Farbe nicht")
         if new.values != old.values:
             raise ValidationError(f"{name}: eine statische Farbe hat keine Schwellen")
         if new.palette[1:] != old.palette[1:]:

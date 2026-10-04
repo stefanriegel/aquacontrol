@@ -38,6 +38,7 @@ LED_FLAG_BLINK = 0x0002
 LED_FLAG_BRIGHTNESS = 0x4000  # "Helligkeit nach Datenquelle"
 LED_EDITABLE_FLAGS = LED_FLAG_FADE | LED_FLAG_BLINK | LED_FLAG_BRIGHTNESS
 LED_MAX_THRESHOLDS = 5
+LED_UNUSED_THRESHOLD = 100  # what the device holds in threshold slots that are not in use
 LED_VALUES = 12
 LED_PALETTE = 6
 LED_SOURCE_NONE = -1
@@ -332,14 +333,14 @@ def _encode_led(r: bytearray, b: int, led: LedController) -> None:
         raise ProtocolError(f"LED controller: {n} thresholds, at most {LED_MAX_THRESHOLDS} supported")
     if old.source != led.source:
         struct.pack_into(">h", r, b + 6, led.source)
-    old_n = min(max(old.values[0], 0), LED_VALUES - 2)
+    old_n = min(max(old.values[0], 0), LED_MAX_THRESHOLDS)
     if old.values[0] != n:
         struct.pack_into(">h", r, b + 22, n)
     for k in range(2, 2 + n):  # threshold slots in use
         if old.values[k] != led.values[k]:
             struct.pack_into(">h", r, b + 22 + 2 * k, led.values[k])
-    for k in range(2 + n, 2 + old_n):  # slots freed by shrinking are zeroed, like aquasuite does
-        struct.pack_into(">h", r, b + 22 + 2 * k, 0)
+    for k in range(2 + n, 2 + old_n):  # slots freed by shrinking get 100, like the unused slots on the device
+        struct.pack_into(">h", r, b + 22 + 2 * k, LED_UNUSED_THRESHOLD)
     for k in range(n + 1):  # colours in use
         if old.palette[k] != led.palette[k]:
             _put_colour(r, b, k, led.palette[k])
@@ -360,7 +361,7 @@ def with_led(settings: Settings, index: int, *, thresholds: tuple[int, ...] | No
 
     `changes` are LedController fields (flags, source, values, palette ...). `thresholds` sets values[0] and the
     threshold slots; when that grows the colour list, the new colours are copies of the last existing colour.
-    `colors` then replaces the leading palette entries. Slots freed by shrinking are zeroed only by
+    `colors` then replaces the leading palette entries. Slots freed by shrinking are set to 100 only by
     encode_settings, so the model keeps what the device reported.
     """
     led = replace(settings.leds[index], **changes)

@@ -212,13 +212,26 @@ class EncodeLedTest(unittest.TestCase):
         out = self.enc(p.with_led(self.s, 0, thresholds=(35, 45, 55), colors=colors))
         self.assertEqual(p.decode_settings(out).leds[0].colors[3], (1024, 255, 255))
 
-    def test_shrinking_zeroes_the_freed_slots_and_keeps_the_palette_tail(self):
-        out = self.enc(p.with_led(self.s, 0, thresholds=(40,)))
+    def test_shrinking_writes_100_into_the_freed_slots_and_keeps_the_palette_tail(self):
+        out = self.enc(p.with_led(self.s, 0, thresholds=(35,)))
         d = p.decode_settings(out).leds[0]
-        self.assertEqual((d.threshold_count, d.thresholds), (1, (40,)))
-        self.assertEqual(d.values, (1, 0, 40, 0, 100, 100, 100, 70, 0, 0, 0, 0))  # slot 3 zeroed, 100s kept
+        self.assertEqual((d.threshold_count, d.thresholds), (1, (35,)))
+        self.assertEqual(d.values, (1, 0, 35, 100, 100, 100, 100, 70, 0, 0, 0, 0))  # slot 3 -> 100, values[7] kept
         self.assertEqual(d.palette, self.s.leds[0].palette)  # only colours 0..n are ever written
-        self.assertEqual(diff(self.r, out), [420, 424, 426])
+        self.assertEqual(diff(self.r, out), [420, 426])
+
+    def test_shrinking_from_a_larger_count_never_reaches_values_7(self):
+        r = bytearray(self.r)
+        b = 397  # C1
+        r[b + 23] = 7  # values[0] = 7 (more than the five slots)
+        r[959:961] = p.crc16_usb(bytes(r[1:959])).to_bytes(2, "big")
+        base = bytes(r)
+        s = p.decode_settings(base)
+        self.assertEqual(s.leds[0].values[0], 7)
+        out = p.encode_settings(p.with_led(s, 0, thresholds=(35,)), base)
+        d = p.decode_settings(out).leds[0]
+        self.assertEqual(d.values[2:7], (35, 100, 100, 100, 100))
+        self.assertEqual(d.values[7], 70)
 
     def test_static_colour_edit_touches_only_palette_0(self):
         out = self.enc(p.with_led(self.s, 1, colors=((0x03ff, 200, 100),)))

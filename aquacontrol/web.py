@@ -323,7 +323,9 @@ class App:
                 if len(req["colors"]) != expected:
                     raise BadRequest(f"colors braucht genau {expected} Farben (eine mehr als Schwellen)")
                 # A colour that is the hex form of what the device holds stays as it is: converting it
-                # back would round the hue (aquasuite's green is 511, "#00ff00" is 512).
+                # back may not give the stored hue again (low saturation/value, rounding), and an
+                # untouched colour must never be rewritten. (Aquasuite's green 511 is "#01ff00", which
+                # does round-trip; only "#00ff00" maps to 512.)
                 keep = tuple(old if hsv1536_to_hex(*old) == color.lower() else new
                              for (color, new), old in zip(req["colors"], led.palette))
                 s = p.with_led(s, i, colors=keep)

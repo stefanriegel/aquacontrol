@@ -19,24 +19,25 @@ LED-Bereiche und der Modus selbst bleiben unveränderlich.
 - **Schwellen** `values[2 .. 1+n]`:
   - Anzahl n = `values[0]`, änderbar von 1 bis 5. Dazu gehören n+1 Farben (Palette mit 6 Plätzen).
   - Ganze Zahlen, streng steigend, innerhalb des Quellbereichs `binding1.x1 .. binding1.x2` (beim Nutzer 20–70 °C).
-  - Ändert sich n, werden die Schwellen-Slots, die dann unbenutzt sind, auf 0 gesetzt, wie es die Aquasuite bei neuen
-    Effekten tut. Die Palette wird gekürzt bzw. mit der letzten Farbe aufgefüllt.
+  - Ändert sich n, werden die Schwellen-Slots, die dann unbenutzt sind (nur Slots 2..6, nie `values[7]`), auf 100
+    gesetzt, wie die unbenutzten Plätze im Gerät. Die Palette wird gekürzt bzw. mit der letzten Farbe aufgefüllt.
 - **Farben** `palette[0 .. n]`: Farbton 0–1535, Sättigung und Helligkeit 0–255. Die API nimmt sie auch als `"#RRGGBB"`
   entgegen; die Umrechnung erfolgt im Server (Ton = Grad·1536/360, gerundet, mod 1536; S und V wie HSV·255).
 - **Schalter:** Überblenden `0x0001`, Blinken `0x0002`, Helligkeit nach Datenquelle `0x4000`. Andere Flag-Bits bleiben
   unverändert.
 - **Datenquelle:** nur Temperatursensoren 1–4 (Index 0–3). Dieselbe Einheit, deshalb bleiben die Bindings gültig. Flow,
   Software-Sensoren und Lüfter sind nicht wählbar; ihr Format ist nicht vollständig entschlüsselt. Ist schon so eine Quelle
-  gesetzt, wird sie nur angezeigt.
+  gesetzt (Flow, Software-Sensor, keine), kann sie auch nicht geändert werden: nur Anzeige, Änderung nur in der Aquasuite.
 
 ### Modus 0x01, statische Farbe
 - `palette[0]` ist bearbeitbar.
-- Schalter wie oben, sofern gesetzt. Sonst nur Anzeige.
+- Schalter: nur Überblenden und Blinken. „Helligkeit nach Datenquelle“ nur, wenn das Bit schon gesetzt ist (dann nur
+  ausschaltbar); der Server lehnt das Setzen ab.
 
 ### Nie geschrieben
 - +0..+3 (Strip, Start, Anzahl, Modus)
 - +8..+21 (Filter, Bindings)
-- `values[1]` und `values[2+n ..]`, außer beim Nullen nach dem Ändern von n
+- `values[1]` und `values[2+n ..]`, außer beim Auf-100-Setzen nach dem Ändern von n
 - Palette-Plätze jenseits von n (außer beim Auffüllen)
 
 ## 3. Protokoll und Validierung

@@ -86,9 +86,9 @@ Der Tab „LEDs“ bearbeitet die LED-Effekte direkt im QUADRO, ohne Aquasuite:
 - **Farbschalter** (Farbe nach Temperatur): bis zu fünf Schwellen (ganze °C, streng steigend, innerhalb des gespeicherten
   Bereichs), je Schwelle eine Farbe, Datenquelle (Temperatursensor 1–4) sowie Überblenden, Blinken und Helligkeit nach
   Datenquelle. Eine Vorschau-Leiste zeigt die Farbbereiche und den aktuellen Messwert.
-- **Statische Farbe**: eine Farbe plus die drei Schalter.
+- **Statische Farbe**: eine Farbe plus Überblenden und Blinken.
 - Nicht benutzte Controller werden nicht angezeigt. LED-Bereiche, Modus und andere Effektwerte bleiben unverändert; andere
-  Datenquellen (Durchfluss, Software-Sensoren) werden nur angezeigt.
+  Datenquellen (Durchfluss, Software-Sensoren) werden nur angezeigt und lassen sich nur in der Aquasuite ändern.
 - Jede Änderung legt vorher ein Backup an. Beim Wiederherstellen eines Backups dürfen sich LED-Daten unterscheiden
   (Pumpe und Lüfter werden weiterhin vollständig geprüft).
 - API: `GET /api/settings` (`leds[]`) und `PUT /api/settings/led/1..8` mit `thresholds`, `colors` (`"#rrggbb"`), `fade`,

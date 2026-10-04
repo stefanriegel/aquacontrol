@@ -146,6 +146,32 @@ class WebTest(unittest.TestCase):
         self.assertEqual(settings["leds"][0]["colors"][0], "#0000ff")
         self.assertEqual(self.backups.load(body["backup"]), load("settings_live.bin"))
 
+    def set_c1_source(self, source):
+        r = bytearray(load("settings_live.bin"))
+        r[397 + 6:397 + 8] = source.to_bytes(2, "big", signed=True)
+        r[959:961] = p.crc16_usb(bytes(r[1:959])).to_bytes(2, "big")
+        self.fake.settings = bytes(r)
+
+    def test_update_led_source_of_a_display_only_controller_is_not_changeable(self):
+        for source in (4, -1):
+            with self.subTest(source=source):
+                self.set_c1_source(source)
+                status, resp = self.req("PUT", "/api/settings/led/1", {"source": 0})
+                self.assertEqual(status, 400, resp)
+                self.assertIn("Aquasuite", resp["error"])
+                self.assertEqual(self.fake.writes, [])
+                status, body = self.req("PUT", "/api/settings/led/1", {"thresholds": [38, 48]})  # other edits still work
+                self.assertEqual((status, body["changed"]), (200, True))
+                self.assertEqual(self.device.read_settings().leds[0].source, source)
+                self.fake.writes.clear()
+
+    def test_update_static_led_cannot_gain_brightness_by_source(self):
+        status, resp = self.req("PUT", "/api/settings/led/2", {"brightness_by_source": True})
+        self.assertEqual(status, 400, resp)
+        self.assertEqual(self.fake.writes, [])
+        status, body = self.req("PUT", "/api/settings/led/2", {"brightness_by_source": False, "blink": True})
+        self.assertEqual((status, body["changed"]), (200, True))
+
     def test_update_led_unchanged_colours_keep_the_exact_device_hue(self):
         status, body = self.req("PUT", "/api/settings/led/1", {"colors": ["#01ff00", "#fffe00", "#ff0000"]})
         self.assertEqual((status, body["changed"], self.fake.writes), (200, False, []))  # h=511 stays 511
@@ -156,7 +182,7 @@ class WebTest(unittest.TestCase):
         self.assertEqual((led.thresholds, len(led.colors), led.colors[3]), ((30, 40, 50), 4, (1024, 255, 255)))
         self.req("PUT", "/api/settings/led/1", {"thresholds": [40]})
         led = self.device.read_settings().leds[0]
-        self.assertEqual((led.thresholds, led.values[3]), ((40,), 0))
+        self.assertEqual((led.thresholds, led.values[3]), ((40,), 100))
 
     def test_update_led_adding_a_threshold_without_colours_copies_the_last_colour(self):
         self.req("PUT", "/api/settings/led/1", {"thresholds": [30, 40, 50]})
