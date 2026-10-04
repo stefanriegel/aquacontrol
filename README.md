@@ -51,17 +51,32 @@ deaktiviert** (`enabled: false`, keine HA-Adresse). Details: `docs/superpowers/s
 - **Aus:** nur wenn aquacontrol sie selbst eingeschaltet hat und noch „besitzt“: Wasser ≤ 36 °C seit 10 min und
   mindestens 30 min Laufzeit.
 - **Handbetrieb gewinnt:** Läuft die Klimaanlage schon, passiert nichts. Ändert jemand Zustand, Solltemperatur oder
-  Preset (auch durch Ausschalten), gibt aquacontrol den Besitz ab, schaltet nichts mehr und hält die Sperrzeit ein.
-  Nach einem Daemon-Neustart gilt eine laufende Klimaanlage als fremd.
+  Preset (zwei Abfragen hintereinander mit Abweichung; Temperatur ±0,25 °C, Preset ohne Groß-/Kleinschreibung), gibt
+  aquacontrol den Besitz ab und schaltet nichts mehr. Nach einem Daemon-Neustart gilt eine laufende Klimaanlage als fremd.
+- **Von Hand ausgeschaltet:** Schaltet jemand die Klimaanlage aus (eine eigene oder eine, die aquacontrol laufen sah),
+  schaltet die Automatik **nicht** wieder ein, solange die Einschalt-Bedingung ununterbrochen gilt. Die Pause endet,
+  sobald das Wasser unter die Einschalt-Temperatur fällt, ein Lüfter darunter liegt oder die Temperatur unbekannt ist,
+  spätestens nach `manual_off_pause_minutes` (Standard 120, einstellbar 10 bis 480).
+- **Einschalten bestätigen:** Nach dem Einschalten wartet aquacontrol bis zu 10 s, bis Home Assistant die gesetzten
+  Werte zeigt (die Cloud ist verzögert). Zeigt sie sie nicht, gilt das Einschalten als „unbestätigt“ und wird in den
+  nächsten Zyklen erneut geprüft.
 - **Gegen Pendeln:** mindestens 2 °C Abstand zwischen Ein- und Ausschalt-Temperatur, Mindestlaufzeit (30 min),
   Sperrzeit nach dem Ausschalten (15 min) und höchstens 2 eigene Schaltvorgänge pro Stunde. Das Limit blockiert nur
   das Einschalten, nie das Ausschalten.
 - **Fehler:** QUADRO offline oder Wasser unbekannt: nie einschalten, eine eigene Klimaanlage bleibt an. HA nicht
-  erreichbar: Wiederholung nach 1, 5, dann 15 min; die letzten 20 Ereignisse stehen im Tab.
+  erreichbar oder ein Service-Aufruf schlägt fehl: Wiederholung nach 1, 5, dann 15 min; die letzten 20 Ereignisse
+  stehen im Tab.
 - **Token:** Ein Long-Lived Access Token aus dem HA-Profil. Er liegt in `secrets.json` neben `config.json`
   (Modus 0600), wird nie geloggt und nie von der API zurückgegeben (nur `token_set`). Im Tab ist das Feld leer =
-  unverändert; „Token löschen“ entfernt ihn. „Verbindung testen“ liest nur und schaltet nichts.
-- API: `GET`/`PUT /api/climate`, `POST /api/climate/test`.
+  unverändert; „Token löschen“ entfernt ihn. „Verbindung testen“ liest nur und schaltet nichts. **Ändert man die
+  Adresse ohne neuen Token, wird der gespeicherte Token gelöscht**, damit er nie an eine andere Adresse geschickt wird.
+- **Adresse und Zertifikat:** `http://` oder `https://` mit einem öffentlich vertrauten Zertifikat (z. B. Nabu Casa oder
+  Let's Encrypt). Ein selbstsigniertes Zertifikat wird nicht akzeptiert. Über `http://` im LAN läuft der Token
+  unverschlüsselt über das Netz: nur in einem vertrauenswürdigen Netz verwenden. Benutzer und Passwort in der Adresse
+  (`http://user:pw@…`) werden abgelehnt.
+- **Auswahllisten:** Betriebsart, Preset, Lüfterstufe, Lamellenpositionen und die Entities sind Auswahlfelder. Ihre
+  Werte liest aquacontrol aus Home Assistant (eingebaute Listen, falls HA nicht erreichbar ist).
+- API: `GET`/`PUT /api/climate`, `POST /api/climate/test`, `GET /api/climate/options`.
 
 ## Pushing extra sensors (e.g. GPUs from a VM)
 

@@ -53,10 +53,29 @@ Reihenfolge:
 Alle Werte sind konfigurierbar. Danach liest aquacontrol den Zustand und merkt sich einen **Fingerabdruck** dessen, was es
 gesetzt hat: hvac-Zustand, Zieltemperatur, Preset. Ab dann gilt **Besitz = aquacontrol**.
 
+Die Cloud-Integration zeigt das Ergebnis eines Service-Aufrufs erst nach etwa 0,5 s. Deshalb fragt aquacontrol den Zustand
+alle 0,5 s ab, höchstens 10 s lang, bis er einen laufenden Zustand mit der eingestellten Temperatur (±0,25 °C) und dem
+Preset (ohne Groß-/Kleinschreibung) zeigt, und nimmt den Fingerabdruck aus dieser Abfrage. Zeigt HA bis dahin einen
+laufenden Zustand mit anderen Werten, gilt der Besitz mit dem letzten Stand als „unbestätigt“; sobald die eingestellten
+Werte erscheinen, ist er bestätigt. Zeigt HA noch `off`, ist die Anlage nicht im Besitz, wird aber in den folgenden Zyklen
+(10 min lang) erneut gelesen: zeigt sie die eingestellten Werte, wird der Besitz übernommen.
+
 ### Besitz abgeben
 Solange aquacontrol im Besitz ist, wird bei jedem Zyklus geprüft:
-- Weicht der HA-Zustand vom Fingerabdruck ab, hat jemand etwas geändert, auch durch Ausschalten. Dann gibt aquacontrol
-  den Besitz ab, schaltet nichts mehr und protokolliert „Handbetrieb übernommen“.
+- Weicht der HA-Zustand vom Fingerabdruck ab (Temperatur mit ±0,25 °C Toleranz, Preset ohne Groß-/Kleinschreibung), hat
+  jemand etwas geändert, auch durch Ausschalten. Nach **zwei aufeinanderfolgenden** abweichenden Abfragen gibt aquacontrol
+  den Besitz ab, schaltet nichts mehr und protokolliert „Handbetrieb übernommen“. `unavailable`/`unknown` zählt nicht als Abweichung.
+- Zeigt HA nach einem fehlgeschlagenen `turn_off` später `off`, gilt das als eigenes Ausschalten (zählt als Schaltvorgang,
+  Sperrzeit), nicht als Handbetrieb.
+
+### Von Hand ausgeschaltet
+Beobachtet aquacontrol einen Wechsel auf `off`, den es nicht selbst verursacht hat, schaltet es **nicht wieder ein**, solange
+die Einschalt-Bedingung ununterbrochen gilt. Das gilt für eine eigene Anlage (Besitzabgabe mit Zustand `off`) und für eine
+fremde, die aquacontrol laufen sah und die jetzt `off` ist (`unavailable`/`unknown` davor zählt nicht). Status `cooldown`,
+Grund „Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (spätestens HH:MM)“.
+- Die Pause endet, sobald die Einschalt-Bedingung einmal unterbrochen ist (Wasser < `on.water_c`, ein Lüfter unter
+  `on.fan_percent`, Wasser unbekannt oder QUADRO offline). Danach gilt das normale Einschalten mit voller `on.minutes`.
+- Obergrenze: `manual_off_pause_minutes` (Standard 120, 10–480).
 - Lamellen-Selects zählen nicht zum Fingerabdruck. Die Cloud meldet sie teils verzögert oder anders zurück.
 
 ### Ausschalten
@@ -73,7 +92,8 @@ Aktion: `climate.turn_off`. Danach ist der Besitz beendet, und die Sperrzeit beg
   Ausschalt-Uhr wird zurückgesetzt.
 - **HA nicht erreichbar oder Service-Fehler:**
   - `last_error` wird gesetzt, und das Ereignis kommt ins Protokoll.
-  - Erneute Versuche frühestens nach 1, dann 5, dann 15 Minuten (Backoff). Erfolg setzt den Backoff zurück.
+  - Erneute Versuche frühestens nach 1, dann 5, dann 15 Minuten (Backoff). Der Backoff wird erst zurückgesetzt, wenn ein
+    ganzer Durchlauf ohne Fehler beendet wurde (eine gelungene Statusabfrage vor einem fehlschlagenden Service-Aufruf zählt nicht).
   - Ein halb ausgeführtes Einschalten zählt trotzdem als Schaltvorgang. Besitz wird nur übernommen, wenn danach `state != off` ist.
 - **Daemon-Neustart:** Besitz und Zeiten liegen nur im Speicher und gehen verloren. Nach einem Neustart ist eine laufende
   Klimaanlage damit „fremd“ und wird nicht automatisch ausgeschaltet. Die sichere Seite ist Kühlen statt Pendeln.
@@ -98,6 +118,7 @@ für eine Entscheidung gebraucht wird:
   "on":  {"water_c": 40.0, "fan_percent": 85.0, "fan_channels": [2, 3], "minutes": 5},
   "off": {"water_c": 36.0, "minutes": 10},
   "min_on_minutes": 30, "min_off_minutes": 15, "max_switches_per_hour": 2,
+  "manual_off_pause_minutes": 120,
   "ac": {"hvac_mode": "cool", "temperature": 20.0, "preset": "Quiet", "fan_mode": "Automatic",
          "horizontal": "left", "vertical": "down_center"}
 }
@@ -110,7 +131,10 @@ für eine Entscheidung gebraucht wird:
 - Kanäle 1–4
 - Temperatur 16–30 in 0,5er-Schritten
 - `hvac_mode` ∈ {cool, dry, fan_only}
-- `ha_url` mit http oder https
+- `manual_off_pause_minutes` 10–480
+- `ha_url` mit http oder https, ohne Benutzer/Passwort (`@` im Host abgelehnt). https nur mit öffentlich vertrautem Zertifikat.
+- `ac.preset`, `ac.fan_mode`, `ac.horizontal`, `ac.vertical`: nur die Form (1–64 Zeichen, keine Steuerzeichen). Die gültigen Werte
+  liefert das Gerät über HA (siehe `GET /api/climate/options`).
 - Entity-IDs: Format `domain.name`, Domain `climate` bzw. `select`
 
 ### Token
@@ -127,12 +151,19 @@ für eine Entscheidung gebraucht wird:
   - `last_error`
   - die letzten 20 Ereignisse
 - `PUT /api/climate`: Teil-Update der Konfiguration. Das optionale `"token"` wird in secrets geschrieben, `""` löscht es. Ein
-  Ändern der Konfiguration setzt Besitz und Zeiten **nicht** zurück.
-- `POST /api/climate/test`: liest die Entity über HA. Antwort: `{"ok", "state", "temperature", "preset", "swing": {...}}`
-  oder ein Fehler. Dabei wird nichts geschaltet.
+  Ändern der Konfiguration setzt Besitz und Zeiten **nicht** zurück. Ändert sich `ha_url` ohne neues `token` in derselben
+  Anfrage, wird das gespeicherte Token gelöscht (Antwort: `token_set: false` und ein deutscher `notice`).
+- `POST /api/climate/test`: liest die Entity und beide Lamellen-Selects über HA. Antwort (flach):
+  `{"ok", "state", "temperature", "preset", "fan_mode", "horizontal", "vertical"}` oder ein Fehler. Dabei wird nichts geschaltet.
+- `GET /api/climate/options`: liest `/api/states` und liefert `hvac_modes` (nur cool/dry/fan_only), `preset_modes`, `fan_modes`,
+  `horizontal`, `vertical` (aus den `options` der beiden Selects), `climate_entities`, `select_entities` (nur Ids mit „swing“,
+  sonst alle `select.*`), außerdem `fallback` (eingebaute Listen), `source` (`ha` | `fallback`) und `error`. Optional
+  `?entity_id=&horizontal_select=&vertical_select=` für noch nicht gespeicherte Entities.
 
 ### Tab „Klima“
-- An/Aus-Schalter und Felder für alle Werte
+- An/Aus-Schalter und Felder für alle Werte. Wo nur feste Werte gültig sind (Entities, Betriebsart, Preset, Lüfterstufe,
+  Lamellen), gibt es Auswahlfelder aus `GET /api/climate/options`, der gespeicherte Wert bleibt wählbar („(gespeichert)“).
+  Lüfterkanäle sind Checkboxen mit den Lüfternamen. Frei getippt werden nur Adresse, Zahlen und Token.
 - Token-Feld (Passwort-Typ, leer = unverändert)
 - Button „Verbindung testen“
 - Statusbox und Ereignisliste
