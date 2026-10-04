@@ -61,6 +61,45 @@ class DeviceTest(unittest.TestCase):
             self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
         self.assertEqual(self.fake.settings, self.original)
 
+    def test_readback_oserror_rolls_back(self):
+        self.fake.read_faults = [OSError("fake: read failed")]
+        with self.assertRaises(DeviceError) as cm:
+            self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
+        self.assertIn("wiederhergestellt", str(cm.exception))
+        self.assertEqual(len(self.fake.writes), 2)
+        self.assertEqual(self.fake.writes[1], self.original)
+        self.assertEqual(self.fake.settings, self.original)
+
+    def test_readback_crc_corrupt_rolls_back(self):
+        self.fake.read_faults = ["corrupt"]
+        with self.assertRaises(DeviceError) as cm:
+            self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
+        self.assertIn("wiederhergestellt", str(cm.exception))
+        self.assertEqual(len(self.fake.writes), 2)
+        self.assertEqual(self.fake.settings, self.original)
+
+    def test_rollback_verification_failure_is_reported(self):
+        self.fake.read_faults = [OSError("fake: read failed"), "corrupt"]
+        with self.assertRaises(DeviceError) as cm:
+            self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
+        self.assertIn("nicht bestätigt", str(cm.exception))
+        self.assertNotIn("wiederhergestellt", str(cm.exception))
+        self.assertEqual(len(self.fake.writes), 2)
+
+    def test_rollback_write_failure_is_reported(self):
+        self.fake.read_faults = [OSError("fake: read failed")]
+        real_set = self.fake.set_feature
+
+        def set_feature(report):
+            if self.fake.writes:  # first write applies, the rollback write fails
+                raise OSError("fake: rollback write failed")
+            real_set(report)
+
+        self.fake.set_feature = set_feature
+        with self.assertRaises(DeviceError) as cm:
+            self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
+        self.assertIn("nicht bestätigt", str(cm.exception))
+
     def test_device_absent(self):
         self.fake.present = False
         with self.assertRaises(DeviceError):
@@ -85,6 +124,7 @@ class DeviceTest(unittest.TestCase):
             self.dev.restore(self.original[:-1])
 
     def test_concurrent_applies_are_serialised(self):
+        self.fake.read_delay = 0.05  # without the lock both threads read the same old report
         barrier = threading.Barrier(2)
         errors = []
 

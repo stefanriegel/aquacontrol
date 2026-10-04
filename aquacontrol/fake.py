@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from .protocol import (COMMIT_REPORT, NAMES_REPORT_ID, SETTINGS_REPORT_ID, SETTINGS_REPORT_LEN,
                        STATUS_REPORT_LEN)
@@ -9,7 +10,7 @@ from .transport import DeviceUnavailable
 
 
 class FakeTransport:
-    def __init__(self, settings: bytes, names: bytes | None = None):
+    def __init__(self, settings: bytes, names: bytes | None = None, read_delay: float = 0.0):
         self.settings = settings
         self.names = names
         self.present = True
@@ -17,6 +18,10 @@ class FakeTransport:
         self.writes: list[bytes] = []   # every settings report written
         self.commits = 0
         self.fail_next_write = False
+        self.read_delay = read_delay    # seconds each settings read takes (widens race windows)
+        # Faults for settings reads made after the first write, consumed in order:
+        # an Exception instance is raised, "corrupt" returns a CRC-broken report.
+        self.read_faults: list[Exception | str] = []
         self._lock = threading.Lock()
 
     def _check(self) -> None:
@@ -26,7 +31,17 @@ class FakeTransport:
     def get_feature(self, report_id: int, length: int) -> bytes:
         self._check()
         if report_id == SETTINGS_REPORT_ID:
-            return self.settings
+            report = self.settings
+            if self.read_delay:
+                time.sleep(self.read_delay)
+            if self.writes and self.read_faults:
+                fault = self.read_faults.pop(0)
+                if isinstance(fault, Exception):
+                    raise fault
+                corrupt = bytearray(report)
+                corrupt[50] ^= 1
+                return bytes(corrupt)
+            return report
         if report_id == NAMES_REPORT_ID and self.names is not None:
             return self.names
         raise OSError(f"fake: unsupported feature report {report_id:#04x}")

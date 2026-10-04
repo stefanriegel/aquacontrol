@@ -102,12 +102,15 @@ class Device:
         try:
             self._write(new_report)
             self._verify(new_report)
-        except (VerifyError, OSError) as e:
+        except (OSError, DeviceError) as e:  # failed write, failed read-back or mismatch
             log.error("write failed (%s), rolling back", e)
             try:
                 self._write(old_report)
-            except OSError as e2:
-                raise DeviceError(f"Schreiben fehlgeschlagen ({e}) und Rücksetzen fehlgeschlagen ({e2})") from e2
+                self._verify(old_report)
+            except (OSError, DeviceError) as e2:
+                log.error("rollback not confirmed (%s)", e2)
+                raise DeviceError(f"Schreiben fehlgeschlagen ({e}) und Rücksetzen nicht bestätigt ({e2})") from e2
+            log.error("old settings restored and verified")
             raise DeviceError(f"Schreiben fehlgeschlagen, alter Stand wiederhergestellt: {e}") from e
         log.info("settings written (%s), backup %s", reason or "change", name)
         return ApplyResult(changed=True, backup=name)
