@@ -96,3 +96,17 @@ Without `dev/config.json` pointing `backup_dir` at a local path, writes try `/va
 
 Test fixtures are real device reports. Status reports must have the device serial zeroed
 (`tools/make_fixture.py` does that); the settings and names reports contain no serial.
+
+## Hardware verification (QUADRO firmware 1033, 2026-10-04)
+
+- Read path: live values via hidraw match the kernel hwmon driver exactly (temperature, all fan RPMs, flow);
+  settings decode matches the device; feature read returns 961 bytes.
+- No-op write (`selftest-write`): settings written, committed as **feature** report 0x02, read back byte-identical.
+  No device-volatile bytes (`VOLATILE_OFFSETS` stays empty).
+- Real writes take effect immediately: channel 4 fixed 60 % → 499 → 1094 rpm; restoring the backup returned it to
+  target-temperature mode and ~540 rpm. (The firmware-1033 "write has no effect" issue does not occur with this commit.)
+- LED strip: brightness 60, off (flag 0x0002) and on again via the API were confirmed visually.
+- Schedule: test rules switched the strip off and on at the configured minute.
+- Curve semantics: the device maps curve percentages linearly into [min, max]
+  (pump: curve 4.31 % with min 28.02 / max 90.3 → output 30.70 %, reported 30.7 %).
+- Open: persistence across a QUADRO power cycle (pending), full host reboot test (when a reboot is planned anyway).
