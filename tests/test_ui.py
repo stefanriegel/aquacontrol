@@ -121,6 +121,18 @@ class LedUiTest(unittest.TestCase):
         self.assertEqual(opts[0], {"value": 4, "label": "Durchfluss (nur Anzeige)", "disabled": True})
         self.assertEqual(len(opts), 5)
 
+    def test_toggles_of_a_static_colour_offer_brightness_only_when_it_is_already_set(self):
+        flags = {"fade": False, "blink": False, "brightness_by_source": False}
+        self.assertEqual(run_js("ledToggleKeys", ["statisch", flags]), ["fade", "blink"])
+        self.assertEqual(run_js("ledToggleKeys", ["statisch", {**flags, "brightness_by_source": True}]),
+                         ["fade", "blink", "brightness_by_source"])
+        self.assertEqual(run_js("ledToggleKeys", ["farbschalter", flags]), ["fade", "blink", "brightness_by_source"])
+
+    def test_source_is_locked_unless_it_is_a_temperature_sensor(self):
+        for source, locked in ((0, False), (3, False), (4, True), (-1, True), (7, True)):
+            with self.subTest(source=source):
+                self.assertEqual(run_js("ledSourceLocked", [source, 4]), locked)
+
     def test_tab_markup(self):
         html = (APP_JS.parent / "index.html").read_text()
         self.assertIn('id="led-list"', html)
@@ -130,6 +142,7 @@ class LedUiTest(unittest.TestCase):
         self.assertIn("− Schwelle", src)
         for text in ("Überblenden", "Blinken", "Helligkeit nach Datenquelle"):
             self.assertIn(text, src)
+        self.assertIn("Quelle nur in der Aquasuite änderbar", src)
 
 
 FIELDS = [

@@ -397,6 +397,19 @@ function ledSourceOptions(sensorNames, source, sourceName) {
   return opts;
 }
 
+// Which switches a controller card offers. A static colour has no data source, so "Helligkeit nach Datenquelle"
+// is only shown when the flag is already set (it can then be switched off, never on).
+function ledToggleKeys(mode, flags) {
+  const keys = ["fade", "blink"];
+  if (mode === "farbschalter" || flags.brightness_by_source) keys.push("brightness_by_source");
+  return keys;
+}
+
+// True if the current data source is not one of the four temperature sensors: it is then only shown.
+function ledSourceLocked(source, sensorCount) {
+  return !(Number.isInteger(source) && source >= 0 && source < sensorCount);
+}
+
 function ledPreview(state) {
   const W = 400, X0 = 6, X1 = 394, Y = 26, H = 20;
   const bar = state.preview;
@@ -449,15 +462,14 @@ function ledCard(led, sensorNames) {
   const problem = el("p", { class: "msg err" });
   const chain = el("div", { class: "led-chain" });
   const toggles = {};
-  const toggle = (key, text) => {
-    toggles[key] = el("input", { type: "checkbox", checked: led.flags[key] });
-    return el("label", { class: "strip-row" }, toggles[key], text);
-  };
+  const toggleTexts = { fade: "Überblenden", blink: "Blinken", brightness_by_source: "Helligkeit nach Datenquelle" };
+  for (const key of ledToggleKeys(led.mode_name, led.flags)) toggles[key] = el("input", { type: "checkbox", checked: led.flags[key] });
 
   const refresh = () => {
     const p = isSwitch ? ledProblem(state.thresholds, led.range) : "";
     problem.textContent = p;
     save.disabled = p !== "";
+    add.disabled = state.thresholds.length >= 5 || ledNewThreshold(state.thresholds, led.range) === null;
     ledPreview(state);
   };
   const build = () => {  // rebuilt when the number of thresholds changes
@@ -473,7 +485,6 @@ function ledCard(led, sensorNames) {
         chain.append(el("span", { class: "led-lt" }, "<"));
       }
     });
-    add.disabled = state.thresholds.length >= 5 || ledNewThreshold(state.thresholds, led.range) === null;
     remove.disabled = state.thresholds.length <= 1;
     refresh();
   };
@@ -490,13 +501,14 @@ function ledCard(led, sensorNames) {
     build();
   });
 
-  const source = el("select", {}, ...ledSourceOptions(sensorNames, led.source, led.source_name)
+  const sourceLocked = ledSourceLocked(led.source, sensorNames.length);
+  const source = el("select", { disabled: sourceLocked }, ...ledSourceOptions(sensorNames, led.source, led.source_name)
     .map((o) => el("option", { value: o.value, selected: o.value === led.source, disabled: o.disabled }, o.label)));
   source.addEventListener("change", () => { state.source = Number(source.value); state.sourceChanged = true; updateLedMarkers(); });
 
   save.addEventListener("click", async () => {
     const body = ledSaveBody({ mode: led.mode_name, thresholds: state.thresholds, colors: state.colors,
-      fade: toggles.fade.checked, blink: toggles.blink.checked, brightness: toggles.brightness_by_source.checked,
+      fade: toggles.fade.checked, blink: toggles.blink.checked, brightness: toggles.brightness_by_source ? toggles.brightness_by_source.checked : led.flags.brightness_by_source,
       source: state.source, sourceChanged: state.sourceChanged });
     save.disabled = true;
     try {
@@ -515,9 +527,10 @@ function ledCard(led, sensorNames) {
     chain,
     isSwitch ? el("div", { class: "led-buttons" }, add, remove) : "",
     problem,
-    el("div", { class: "led-toggles" }, toggle("fade", "Überblenden"), toggle("blink", "Blinken"),
-      toggle("brightness_by_source", "Helligkeit nach Datenquelle")),
-    isSwitch ? el("label", { class: "strip-row" }, "Datenquelle", source) : "",
+    el("div", { class: "led-toggles" },
+      ...Object.keys(toggles).map((key) => el("label", { class: "strip-row" }, toggles[key], toggleTexts[key]))),
+    isSwitch ? el("label", { class: "strip-row" }, "Datenquelle", source,
+      sourceLocked ? el("span", { class: "hint" }, "Quelle nur in der Aquasuite änderbar") : "") : "",
     el("div", { class: "strip-actions" }, save, msg));
   build();
   return card;
