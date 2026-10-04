@@ -4,6 +4,8 @@ import json
 import os
 import signal
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -85,6 +87,33 @@ class MainTest(unittest.TestCase):
                                 "--port", str(port)])
         self.assertEqual(rc, 0)
         self.assertEqual(events, ["scheduler-stopped", "close"])
+
+    def test_signal_during_startup_still_stops_the_daemon(self):
+        """SIGTERM/SIGINT arriving before serve_forever() (here: right after the server socket exists)
+        must lead to a clean exit. Runs in a subprocess: without early handlers the signal would
+        kill (or interrupt) the test process itself."""
+        self.daemon.write_text(json.dumps({"password_hash": hash_password("langes-passwort", iterations=1000)}))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        script = """
+import os, signal, sys
+from aquacontrol import __main__ as m
+real = m.make_server
+def make_server(*a, **k):
+    server = real(*a, **k)
+    os.kill(os.getpid(), getattr(signal, sys.argv[1]))
+    return server
+m.make_server = make_server
+sys.exit(m.main(["--daemon-config", sys.argv[2], "--app-config", sys.argv[3], "run", "--fake", sys.argv[4],
+                 "--no-tls", "--listen", "127.0.0.1", "--port", sys.argv[5]]))
+"""
+        root = Path(__file__).resolve().parent.parent
+        for name in ("SIGTERM", "SIGINT"):
+            with self.subTest(signal=name):
+                proc = subprocess.run([sys.executable, "-c", script, name, str(self.daemon), str(self.app),
+                                       str(FIXTURES), str(port)], cwd=root, capture_output=True, timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode())
 
 
 if __name__ == "__main__":

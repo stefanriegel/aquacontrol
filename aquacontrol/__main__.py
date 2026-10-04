@@ -55,6 +55,16 @@ def cmd_run(args) -> int:
     if not daemon.password_hash:
         log.error("kein Passwort gesetzt: python3 -m aquacontrol set-password")
         return 2
+    # Handlers first: a signal during startup (device open, TLS load, socket bind) must lead to a
+    # clean shutdown too, not to the default action. The handler only sets the stop event, from a
+    # helper thread, because Event.set() takes a lock the interrupted main thread might hold.
+    stop = threading.Event()
+
+    def request_stop(*_):
+        threading.Thread(target=stop.set, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
     device, monitor, scheduler, backups, config, externals = build(args)
     app = App(device, monitor, scheduler, backups, config, externals, daemon.password_hash,
               daemon.push_tokens, args.static)
@@ -68,25 +78,25 @@ def cmd_run(args) -> int:
     host = args.listen or daemon.listen
     port = args.port or daemon.port
     server = make_server(app, host, port, cert, key)
-    stop = threading.Event()
     threads = [threading.Thread(target=monitor.run, args=(stop,), name="monitor", daemon=True)]
     if not args.no_schedule:
         threads.append(threading.Thread(target=scheduler.run, args=(stop,), name="scheduler", daemon=True))
-    for t in threads:
-        t.start()
-
-    def shutdown(*_):
-        stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-    log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
+    serving = threading.Thread(target=server.serve_forever, name="http", daemon=True)
+    started_serving = False
     try:
-        server.serve_forever()
+        for t in threads:
+            t.start()
+        serving.start()
+        started_serving = True
+        log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
+        stop.wait()  # a signal that came earlier has already set it
     finally:
-        # let a running device write (scheduler or request thread) finish before the process exits
+        # order: stop event -> http server -> scheduler -> device -> socket. A running device write
+        # (scheduler or request thread) finishes before the process exits.
         stop.set()
+        if started_serving:
+            server.shutdown()
+            serving.join(15)
         for t in threads:
             if t.name == "scheduler":
                 t.join(15)
