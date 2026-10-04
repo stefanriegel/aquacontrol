@@ -1,0 +1,9 @@
+[Unit]
+Description=Push GPU sensors to aquacontrol
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/aquacontrol-push.env
+ExecStart=/usr/local/bin/aquacontrol-push-gpu.sh
+DynamicUser=yes
+SupplementaryGroups=video

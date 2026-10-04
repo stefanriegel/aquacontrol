@@ -1,0 +1,10 @@
+[Unit]
+Description=Push GPU sensors to aquacontrol every 5 s
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=5
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target

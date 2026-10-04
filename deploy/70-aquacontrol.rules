@@ -1,0 +1,2 @@
+# Give the aquacontrol service access to the Aquacomputer QUADRO hidraw node.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c70", ATTRS{idProduct}=="f00d", GROUP="aquacontrol", MODE="0660"

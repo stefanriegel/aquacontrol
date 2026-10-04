@@ -1,0 +1,37 @@
+[Unit]
+Description=aquacontrol - web control for the Aquacomputer QUADRO
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aquacontrol
+Group=aquacontrol
+WorkingDirectory=/opt/aquacontrol
+ExecStart=/usr/bin/python3 -m aquacontrol run
+Environment=PYTHONDONTWRITEBYTECODE=1
+# cert/key are provided by the drop-in written by install.sh (LoadCredential=cert:..., key:...)
+StateDirectory=aquacontrol
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
