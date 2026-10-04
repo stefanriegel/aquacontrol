@@ -32,6 +32,7 @@ class FakeClient:
         self.clock = lambda: 0.0
         self.stamps = []          # (what, time) of every call: "get", "domain.service"
         self.lag = 0              # state changes become visible only after this many get_state calls
+        self.lag_services = None  # restrict the lag to these services (None: all)
         self._queued = []         # [remaining reads, change] pairs
         self.states = {
             E: {"state": "off", "attributes": {"temperature": 24.0, "preset_mode": "Normal", "fan_mode": "Automatic"}},
@@ -59,7 +60,7 @@ class FakeClient:
         self.log.append(("call", domain, service, dict(data)))
         self.stamps.append((f"{domain}.{service}", self.clock()))
         self._maybe_fail(f"{domain}.{service}")
-        if self.lag:
+        if self.lag and (self.lag_services is None or service in self.lag_services):
             self._queued.append([self.lag, lambda: self._apply(service, data)])
         else:
             self._apply(service, data)
@@ -365,7 +366,7 @@ class OwnershipTest(unittest.TestCase):
         r = Rig()
         r.bring_on()
         r.client.ac("off")
-        r.advance(0.5)
+        r.advance(1)
         self.assertEqual(r.state(), "cooldown")
         self.assertIn("Handbetrieb übernommen", r.status()["events"][0]["message"])
         self.assertEqual(r.client.calls, [])
@@ -376,7 +377,7 @@ class OwnershipTest(unittest.TestCase):
                 r = Rig()
                 r.bring_on()
                 r.client.ac(change.get("state"), **{k: v for k, v in change.items() if k != "state"})
-                r.advance(0.5)
+                r.advance(1)
                 self.assertIn("Handbetrieb übernommen", r.status()["events"][0]["message"])
                 self.assertIsNone(r.status()["owned_since"])
 
@@ -765,6 +766,191 @@ class ErrorTest(unittest.TestCase):
         self.assertEqual(r.status()["switches_last_hour"], 1)
 
 
+class ReadBackTest(unittest.TestCase):
+    """HA reflects a service call only after about half a second (cloud integration): the read-back must wait."""
+
+    def test_no_waiting_when_the_state_is_reflected_at_once(self):
+        r = Rig()
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.sleeps, [])
+        self.assertEqual(r.status()["unconfirmed"], False)
+
+    def test_waits_until_state_temperature_and_preset_are_reflected(self):
+        r = Rig()
+        r.client.lag = 3                      # three reads still show the old values
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.sleeps, [0.5, 0.5, 0.5])
+        self.assertEqual(r.state(), "owned")
+        self.assertFalse(r.status()["unconfirmed"])
+        r.advance(3)
+        self.assertEqual(r.state(), "owned")  # the fingerprint holds the real values, no false hand-over
+        self.assertNotIn("Handbetrieb", " ".join(e["message"] for e in r.status()["events"]))
+
+    def test_waits_for_the_preset_and_temperature_not_just_the_state(self):
+        r = Rig()
+        r.client.lag, r.client.lag_services = 4, {"set_temperature", "set_preset_mode"}
+        r.tick()
+        r.advance(5)
+        self.assertEqual(len(r.sleeps), 4)    # state was "cool" from the first read, attributes came later
+        r.advance(3)
+        self.assertEqual(r.state(), "owned")
+
+    def test_polls_for_at_most_ten_seconds(self):
+        r = Rig()
+        r.client.lag = 1000
+        r.tick()
+        r.advance(5)
+        self.assertEqual(len(r.sleeps), 20)
+        self.assertEqual(sum(r.sleeps), 10.0)
+
+    def test_not_reflected_but_running_takes_ownership_marked_unconfirmed(self):
+        r = Rig()
+        r.client.lag, r.client.lag_services = 1000, {"set_temperature", "set_preset_mode"}
+        r.tick()
+        r.advance(5)
+        st = r.status()
+        self.assertEqual(st["state"], "owned")
+        self.assertTrue(st["unconfirmed"])
+        self.assertIn("unbestätigt", st["reason"])
+        self.assertIn("unbestätigt", st["events"][0]["message"])
+
+    def test_late_values_confirm_instead_of_handing_over(self):
+        r = Rig()
+        r.client.lag, r.client.lag_services = 27, {"set_temperature", "set_preset_mode"}  # visible after the poll
+        r.tick()
+        r.advance(5)
+        self.assertTrue(r.status()["unconfirmed"])
+        r.advance(5)                          # the configured 20 degrees / Quiet appear now
+        self.assertEqual(r.state(), "owned")
+        self.assertFalse(r.status()["unconfirmed"])
+        self.assertNotIn("Handbetrieb", " ".join(e["message"] for e in r.status()["events"]))
+        r.advance(5)
+        self.assertEqual(r.state(), "owned")
+        r.snapshot = cool()
+        r.advance(45)
+        self.assertEqual(r.client.count("climate", "turn_off"), 1)  # and it gets switched off in the end
+
+    def test_still_off_after_the_poll_is_rechecked_and_taken_over_once_it_shows_the_target(self):
+        r = Rig()
+        r.client.lag = 22                     # even the state needs more than the 21 reads of the poll
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.state(), "arming")
+        self.assertIsNone(r.status()["owned_since"])
+        self.assertIn("nicht bestätigt", r.status()["events"][0]["message"])
+        r.advance(1.5)
+        self.assertEqual(r.state(), "owned")
+        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)   # no second switch-on
+        self.assertFalse(r.status()["unconfirmed"])
+
+    def test_late_but_different_values_are_not_taken_over(self):
+        r = Rig()
+        r.client.ignore_on = True
+        r.tick()
+        r.advance(5)
+        r.client.ac("heat", temperature=23.0)  # somebody else started it
+        r.advance(3)
+        self.assertIsNone(r.status()["owned_since"])
+        r.snapshot = cool()
+        r.advance(60)
+        self.assertEqual(r.client.count("climate", "turn_off"), 0)
+
+    def test_confirmation_window_ends(self):
+        r = Rig()
+        r.client.ignore_on = True
+        r.tick()
+        r.advance(5)
+        r.snapshot = cool()                   # no new switch-on attempt: only the confirmation window polls HA
+        r.advance(9)
+        self.assertGreater(len(r.client.gets), 21)
+        r.advance(1.5)
+        n = len(r.client.gets)
+        r.advance(10)
+        self.assertEqual(len(r.client.gets), n)   # the window of ten minutes is over
+
+    def test_failed_read_back_is_reported_as_unreadable(self):
+        r = Rig()
+        r.tick()
+        r.advance(4.5)
+        orig = r.client.get_state
+        seen = []
+
+        def get_state(eid):
+            seen.append(eid)
+            if len(seen) >= 2:
+                raise HAError("Home Assistant nicht erreichbar: Test")
+            return orig(eid)
+        r.client.get_state = get_state
+        r.advance(0.5)
+        self.assertIn("nicht lesbar", r.status()["events"][0]["message"])
+        self.assertNotIn("meldet weiterhin keinen Betrieb", r.status()["events"][0]["message"])
+
+
+class HandOverToleranceTest(unittest.TestCase):
+    def test_one_mismatching_read_is_not_enough(self):
+        r = Rig()
+        r.bring_on()
+        r.client.ac(temperature=22.0)
+        r.advance(0.5)
+        self.assertEqual(r.state(), "owned")
+        self.assertIsNotNone(r.status()["owned_since"])
+        r.client.ac(temperature=20.0)         # a one-off glitch
+        r.advance(1)
+        self.assertEqual(r.state(), "owned")
+        r.client.ac(temperature=22.0)         # and again: not consecutive with the first one
+        r.advance(0.5)
+        self.assertEqual(r.state(), "owned")
+
+    def test_two_consecutive_mismatching_reads_hand_over(self):
+        r = Rig()
+        r.bring_on()
+        r.client.ac("heat", temperature=22.0)
+        r.advance(1)
+        self.assertEqual(r.state(), "cooldown")
+        self.assertIsNone(r.status()["owned_since"])
+
+    def test_nothing_is_switched_off_while_a_mismatch_is_pending(self):
+        r = Rig()
+        r.bring_on()
+        r.advance(30)
+        r.client.ac(temperature=22.0)
+        r.snapshot = cool()
+        r.advance(10.5)
+        self.assertEqual(r.client.count("climate", "turn_off"), 0)
+
+    def test_temperature_tolerance_is_a_quarter_degree(self):
+        for temp, owned in ((20.2, True), (19.8, True), (20.25, True), (20.5, False), (19.5, False)):
+            with self.subTest(temp=temp):
+                r = Rig()
+                r.bring_on()
+                r.client.ac(temperature=temp)
+                r.advance(2)
+                self.assertEqual(r.status()["owned_since"] is not None, owned)
+
+    def test_preset_is_compared_case_insensitively(self):
+        r = Rig()
+        r.bring_on()
+        r.client.ac(preset_mode="quiet")
+        r.advance(2)
+        self.assertEqual(r.state(), "owned")
+        r.client.ac(preset_mode="Powerful")
+        r.advance(2)
+        self.assertEqual(r.state(), "cooldown")
+
+    def test_unavailable_between_two_mismatches_breaks_the_streak(self):
+        r = Rig()
+        r.bring_on()
+        r.client.ac(temperature=22.0)
+        r.advance(0.5)
+        r.client.ac("unavailable")
+        r.advance(0.5)
+        r.client.ac("cool")
+        r.advance(0.5)
+        self.assertEqual(r.state(), "owned")
+
+
 class ManualOffTest(unittest.TestCase):
     """A person switching the AC off by hand is never countered while the on-condition simply persists."""
 
@@ -845,9 +1031,9 @@ class ManualOffTest(unittest.TestCase):
 
     def test_ceiling_is_configurable_and_defaults_to_two_hours(self):
         r = self.owned_then_off_by_hand()
-        self.assertEqual(r.status()["manual_off_until"] - r.now, 119 * MIN + 30)   # detected after 30 s
+        self.assertEqual(r.status()["manual_off_until"] - r.now, 120 * MIN)
         r = self.owned_then_off_by_hand(manual_off_pause_minutes=10)
-        self.assertEqual(r.status()["manual_off_until"] - r.now, 9 * MIN + 30)
+        self.assertEqual(r.status()["manual_off_until"] - r.now, 10 * MIN)
 
     def test_the_pause_is_logged(self):
         r = self.owned_then_off_by_hand()

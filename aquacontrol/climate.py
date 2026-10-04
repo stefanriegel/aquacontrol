@@ -239,6 +239,11 @@ BACKOFF_S = (60, 300, 900)  # pause after the 1st, 2nd, 3rd (and later) consecut
 EVENT_LIMIT = 20
 HOUR_S = 3600
 UNAVAILABLE = ("unavailable", "unknown")
+READBACK_POLL_S = 0.5    # after switching on, HA shows the new state after about half a second (cloud integration)
+READBACK_MAX_S = 10.0
+CONFIRM_WINDOW_S = 600   # how long an unconfirmed switch-on is re-checked on the following cycles
+TEMP_TOLERANCE_C = 0.25
+MISMATCHES_TO_HAND_OVER = 2
 
 
 def _fmt_c(v: float) -> str:
@@ -281,6 +286,9 @@ class ClimateController:
         self._cooldown_until = 0.0
         self._last_seen: str | None = None      # HA state at the last look (None: nothing trustworthy)
         self._manual_off_until: float | None = None  # set: a person switched the AC off, no automatic on until then
+        self._mismatches = 0           # consecutive reads that differ from the fingerprint while owned
+        self._unconfirmed = False      # owned, but HA has not shown the configured temperature/preset yet
+        self._confirm_until: float | None = None  # switched on, HA still says off: keep looking until then
         self._off_pending = False      # our turn_off failed: a later "off" is still our own doing
         self._next_poll = 0.0          # a foreign (manually running) AC is looked at again only from here on
         self._switches: list[float] = []
@@ -334,6 +342,7 @@ class ClimateController:
             "cooldown_until": self._cooldown_until if self._owned_since is None and now < self._cooldown_until else None,
             "off_condition_since": self._off_since,
             "manual_off_until": self._manual_off_until,
+            "unconfirmed": self._unconfirmed and self._owned_since is not None,
             "retry_at": self._retry_at,
             "last_error": self._last_error,
             "switches_last_hour": self._switch_count(now),
@@ -376,6 +385,30 @@ class ClimateController:
         temp = float(temp) if _is_number(temp) else None
         return (st.get("state"), temp, attrs.get("preset_mode"))
 
+    @staticmethod
+    def _temp_close(a: float | None, b: float | None) -> bool:
+        return a is None and b is None or (a is not None and b is not None and abs(a - b) <= TEMP_TOLERANCE_C)
+
+    @staticmethod
+    def _preset_equal(a: object, b: object) -> bool:
+        return (a.casefold() if isinstance(a, str) else a) == (b.casefold() if isinstance(b, str) else b)
+
+    def _same(self, a: tuple, b: tuple) -> bool:
+        """Fingerprints agree: same state, temperature within the tolerance, preset ignoring case."""
+        return a[0] == b[0] and self._temp_close(a[1], b[1]) and self._preset_equal(a[2], b[2])
+
+    def _reflects(self, st: dict, cfg: ClimateConfig) -> bool:
+        """HA shows a running AC with the configured temperature and preset."""
+        state, temp, preset = self._fingerprint_of(st)
+        return (state not in ("off", None, *UNAVAILABLE) and self._temp_close(temp, cfg.ac.temperature)
+                and self._preset_equal(preset, cfg.ac.preset))
+
+    def _take_ownership(self, now: float, st: dict, confirmed: bool) -> None:
+        self._owned_since, self._fingerprint = now, self._fingerprint_of(st)
+        self._arming_since = self._off_since = self._confirm_until = None
+        self._unconfirmed, self._mismatches, self._off_pending = not confirmed, 0, False
+        self._last_seen = st.get("state")
+
     def _read(self, now: float, client, entity_id: str) -> dict | None:
         try:
             st = client.get_state(entity_id)
@@ -398,8 +431,9 @@ class ClimateController:
             if self._owned_since is not None:
                 self._event(now, "Automatik deaktiviert, Besitz abgegeben (die Klimaanlage bleibt unverändert)")
             self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
-            self._last_seen = self._manual_off_until = None
-            self._off_pending = False
+            self._last_seen = self._manual_off_until = self._confirm_until = None
+            self._off_pending = self._unconfirmed = False
+            self._mismatches = 0
             self._failures, self._retry_at = 0, None
             self._state, self._reason = "disabled", "Automatik ist deaktiviert"
             return
@@ -464,15 +498,26 @@ class ClimateController:
         if st is None:
             return
         if st.get("state") in UNAVAILABLE:
+            self._mismatches = 0  # not a reading of the AC: it breaks a streak of mismatches
             self._reason = "Klimaanlage ist in Home Assistant gerade nicht verfügbar, es wird nichts geschaltet"
             return
         self._last_seen = st.get("state")
-        if self._fingerprint_of(st) != self._fingerprint:
-            if st.get("state") == "off" and self._off_pending:  # our turn_off timed out, but HA did execute it
-                self._finish_off(now, cfg, "Klimaanlage ist aus: das Ausschalten war als Fehler gemeldet worden, "
-                                           "gilt als eigenes Ausschalten")
-            else:
-                self._hand_over(now, cfg, st)
+        fp = self._fingerprint_of(st)
+        if self._unconfirmed and self._reflects(st, cfg):  # the configured values arrived late: now it is certain
+            self._fingerprint, self._unconfirmed, self._mismatches = fp, False, 0
+            self._event(now, "Einschalten bestätigt: Home Assistant zeigt jetzt die eingestellten Werte")
+        elif self._same(fp, self._fingerprint):
+            self._mismatches = 0
+        elif fp[0] == "off" and self._off_pending:  # our turn_off timed out, but HA did execute it
+            self._finish_off(now, cfg, "Klimaanlage ist aus: das Ausschalten war als Fehler gemeldet worden, "
+                                       "gilt als eigenes Ausschalten")
+            return
+        else:
+            self._mismatches += 1
+            if self._mismatches < MISMATCHES_TO_HAND_OVER:  # a stale or glitchy read must not take the AC away
+                self._reason = "Klimaanlage weicht von den eingestellten Werten ab, die nächste Prüfung entscheidet"
+                return
+            self._hand_over(now, cfg, st)
             return
         off_at = None if self._off_since is None else self._off_since + cfg.off.minutes * 60
         run_at = self._owned_since + cfg.min_on_minutes * 60
@@ -481,6 +526,8 @@ class ClimateController:
         elif off_at is None:
             self._reason = ("Klimaanlage läuft (von aquacontrol eingeschaltet)" if water is not None else
                             "Klimaanlage läuft, QUADRO offline oder Wasser unbekannt: bleibt an")
+            if self._unconfirmed:
+                self._reason += " – unbestätigt: eingestellte Werte noch nicht in Home Assistant sichtbar"
         else:
             self._reason = (f"Wasser kühl genug, Ausschalten in frühestens "
                             f"{_minutes_left(max(off_at, run_at) - now)} min")
@@ -488,7 +535,8 @@ class ClimateController:
     def _hand_over(self, now: float, cfg: ClimateConfig, st: dict) -> None:
         state = st.get("state")
         self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
-        self._off_pending = False
+        self._off_pending = self._unconfirmed = False
+        self._mismatches = 0
         self._last_seen = state
         self._cooldown_until = now + cfg.min_off_minutes * 60  # never fight a manual change straight away
         if state == "off":
@@ -530,7 +578,8 @@ class ClimateController:
     def _finish_off(self, now: float, cfg: ClimateConfig, message: str) -> None:
         self._record_switch(now)  # counts as a switch, but is never blocked by the limit
         self._owned_since = self._fingerprint = self._off_since = None
-        self._off_pending = False
+        self._off_pending = self._unconfirmed = False
+        self._mismatches = 0
         self._last_seen = "off"
         self._cooldown_until = now + cfg.min_off_minutes * 60
         self._event(now, message)
@@ -544,6 +593,9 @@ class ClimateController:
                 return
             self._manual_off_until = None
             self._event(now, f"Pause nach dem Ausschalten von Hand abgelaufen ({cfg.manual_off_pause_minutes} min)")
+        self._recheck_confirmation(now, cfg, client)
+        if self._owned_since is not None:  # it showed the configured values after all
+            return
         if now < self._cooldown_until:
             self._state = "cooldown"
             self._reason = f"Sperrzeit: Einschalten frühestens in {_minutes_left(self._cooldown_until - now)} min"
@@ -565,9 +617,10 @@ class ClimateController:
             self._reason = (f"Schaltlimit erreicht ({len(recent)} Schaltvorgänge in der letzten Stunde), "
                             f"Einschalten frühestens in {_minutes_left(free_at - now)} min")
             return
-        self._state = "arming"
         if now < self._next_poll:  # a manually running AC was seen recently: do not ask every cycle
+            self._state = "idle"
             return
+        self._state = "arming"
         if self._backing_off(now):
             return
         st = self._read(now, client, cfg.entity_id)
@@ -610,24 +663,59 @@ class ClimateController:
             self._record_switch(now)  # a half-done switch-on counts as well
         st, read_error = None, None
         if done:
-            try:
-                st = client.get_state(e)
-            except HAError as ex:
-                read_error = ex
+            polls = int(READBACK_MAX_S / READBACK_POLL_S)
+            for i in range(polls + 1):  # HA shows the result of a service call after a moment
+                try:
+                    st = client.get_state(e)
+                except HAError as ex:
+                    read_error = ex
+                    break
+                if self._reflects(st, cfg):
+                    break
+                if i < polls:
+                    self._sleep(READBACK_POLL_S)
         if error is not None:
             self._fail(now, "Einschalten", error)
         elif read_error is not None:
             self._fail(now, "Status nach dem Einschalten", read_error)
+        if st is not None:
+            self._last_seen = st.get("state")
         if st is not None and st.get("state") not in ("off", *UNAVAILABLE):
-            self._owned_since, self._fingerprint = now, self._fingerprint_of(st)
-            self._arming_since = self._off_since = None
+            confirmed = self._reflects(st, cfg)
+            self._take_ownership(now, st, confirmed)
             part = "" if error is None else f" (unvollständig: {done} von {len(steps)} Schritten)"
+            part += "" if confirmed else ", unbestätigt: Home Assistant zeigt die eingestellten Werte noch nicht"
             self._event(now, f"Klimaanlage eingeschaltet{part} (Wasser {_fmt_c(water)}, "
                              f"Lüfter ≥ {cfg.on.fan_percent:g} %)")
             self._state = "owned"
             if error is None:
-                self._reason = "Klimaanlage eingeschaltet, aquacontrol hat den Besitz"
+                self._reason = ("Klimaanlage eingeschaltet, aquacontrol hat den Besitz" if confirmed else
+                                "Klimaanlage eingeschaltet, unbestätigt: eingestellte Werte noch nicht in Home "
+                                "Assistant sichtbar")
         elif done:
-            self._arming_since = now  # not confirmed: start the on-time over instead of hammering the cloud
-            self._event(now, "Einschalten nicht bestätigt: Klimaanlage meldet weiterhin keinen Betrieb")
+            # not confirmed: start the on-time over instead of hammering the cloud, but keep looking: once the AC
+            # shows the configured values on a later cycle, it is ours
+            self._arming_since = now
+            self._confirm_until = now + CONFIRM_WINDOW_S
+            self._event(now, "Einschalten nicht bestätigt: Status nicht lesbar" if st is None else
+                             "Einschalten nicht bestätigt: Klimaanlage meldet weiterhin keinen Betrieb")
             self._state = "arming"
+
+    def _recheck_confirmation(self, now: float, cfg: ClimateConfig, client) -> None:
+        """After a switch-on that HA did not show yet: take ownership as soon as the AC shows the configured values."""
+        if self._confirm_until is None:
+            return
+        if now >= self._confirm_until or self._retry_at is not None and now < self._retry_at:
+            if now >= self._confirm_until:
+                self._confirm_until = None
+            return
+        st = self._read(now, client, cfg.entity_id)
+        if st is None:
+            return
+        self._last_seen = st.get("state")
+        if self._reflects(st, cfg):
+            self._take_ownership(now, st, confirmed=True)
+            self._event(now, "Klimaanlage eingeschaltet (von Home Assistant verzögert bestätigt)")
+            self._state, self._reason = "owned", "Klimaanlage läuft (von aquacontrol eingeschaltet)"
+        elif st.get("state") not in ("off", *UNAVAILABLE):  # running with other settings: somebody else's doing
+            self._confirm_until = None
