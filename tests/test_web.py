@@ -701,6 +701,30 @@ class WebTest(unittest.TestCase):
         self.assertNotIn(self.TOKEN, seen[0][1])
         self.assertNotIn("ha_token", seen[0][1])
 
+    def test_read_decide_write_of_put_climate_happens_under_the_config_lock(self):
+        """Two concurrent PUTs must not decide on stale data: the URL comparison, the token deletion and the
+        write all run inside the config lock."""
+        self.configure_ha()
+        held = []
+        real_set = self.config.secrets.set_ha_token
+
+        def set_token(value):
+            held.append(("token", self.config._lock.locked()))
+            return real_set(value)
+
+        real_store = self.config._store_climate
+
+        def store(cfg):
+            held.append(("store", self.config._lock.locked()))
+            return real_store(cfg)
+
+        with mock.patch.object(self.config.secrets, "set_ha_token", set_token), \
+                mock.patch.object(self.config, "_store_climate", store):
+            status, body = self.req("PUT", "/api/climate", {"ha_url": "http://elsewhere.example:8123"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(held, [("token", True), ("store", True)])
+        self.assertIn("Token", body["notice"])
+
     def test_the_old_token_is_gone_before_the_new_url_is_written_even_with_a_new_token(self):
         self.configure_ha()
         seen = []

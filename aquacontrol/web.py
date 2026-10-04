@@ -23,7 +23,7 @@ from .auth import token_source, verify_password
 from .backups import BackupError, BackupStore
 from .colors import hex_to_hsv1536, hsv1536_to_hex
 from .climate import (FAN_MODES, HORIZONTAL, HVAC_MODES, PRESETS, VERTICAL, ClimateConfigError, ClimateController,
-                      _entity as parse_entity, merge_climate, parse_climate_config)
+                      _entity as parse_entity)
 from .config import AppConfig, Secrets
 from .device import Device, DeviceError
 from .ha import HAError
@@ -406,16 +406,19 @@ class App:
         token = Secrets.clean_token(patch.pop("token")) if "token" in patch else None  # validate before any write
         notice = None
         if patch:
-            current = self.config.climate_config()
-            # normalised new address, validated before anything is written (ClimateConfigError -> 400)
-            new_url = parse_climate_config(merge_climate(current.to_json(), patch)).ha_url
-            if new_url != current.ha_url and self.config.secrets.get_ha_token():
+            dropped: list[bool] = []
+
+            def drop_token() -> None:
                 # The stored token must never be sent to another address than the one it was entered for, not even
-                # for a moment: delete it BEFORE the new address is persisted.
-                self.config.secrets.set_ha_token("")
-                if token is None:
-                    notice = "Adresse geändert: das gespeicherte Token wurde gelöscht, bitte neu eingeben"
-            self.config.patch_climate(patch)
+                # for a moment: delete it BEFORE the new address is persisted. Runs inside the config lock, in the
+                # same step as the comparison of the old and the (normalised) new address.
+                if self.config.secrets.get_ha_token():
+                    self.config.secrets.set_ha_token("")
+                    dropped.append(True)
+
+            self.config.patch_climate(patch, on_url_change=drop_token)  # ClimateConfigError -> 400, nothing written
+            if dropped and token is None:
+                notice = "Adresse geändert: das gespeicherte Token wurde gelöscht, bitte neu eingeben"
         if token is not None:
             self.config.secrets.set_ha_token(token)  # "" removes it
         out = self.climate_json()

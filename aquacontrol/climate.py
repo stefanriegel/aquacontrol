@@ -470,6 +470,7 @@ class ClimateController:
 
         client = self._client_factory()
         if client is None:
+            self._probe_arming = False  # nobody to ask: a stale flag would cause a read at some later tick
             self._state = "owned" if owned else "idle"
             self._reason = "Home Assistant ist nicht eingerichtet (URL oder Token fehlt)"
             return

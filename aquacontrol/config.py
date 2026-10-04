@@ -10,6 +10,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .climate import ClimateConfig, ClimateConfigError, merge_climate, parse_climate_config
 from .schedule import Rule, parse_rules, rules_to_json
@@ -240,12 +241,17 @@ class AppConfig:
             self._store_climate(cfg)
         return cfg
 
-    def patch_climate(self, patch: object) -> ClimateConfig:
-        """Partial update: merge onto the current section under the lock, validate, persist."""
+    def patch_climate(self, patch: object, on_url_change: Callable[[], None] | None = None) -> ClimateConfig:
+        """Partial update: merge onto the current section under the lock, validate, persist.
+        `on_url_change` runs under the same lock, after validation and before the write, when the
+        normalised Home Assistant address differs (the caller drops the stored token there, so the
+        comparison and the write cannot be interleaved with another update)."""
         if not isinstance(patch, dict):
             raise ClimateConfigError("Klima-Konfiguration muss ein Objekt sein")
         with self._lock:
             cfg = parse_climate_config(merge_climate(self._climate.to_json(), patch))
+            if on_url_change is not None and cfg.ha_url != self._climate.ha_url:
+                on_url_change()
             self._store_climate(cfg)
         return cfg
 

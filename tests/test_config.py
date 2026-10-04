@@ -260,6 +260,24 @@ class ClimateSectionTest(unittest.TestCase):
         self.assertEqual(self.path.read_text(), before)
         self.assertTrue(cfg.climate_config().enabled)
 
+    def test_patch_climate_calls_on_url_change_under_the_lock_before_writing(self):
+        cfg = AppConfig(self.path)
+        cfg.patch_climate({"ha_url": "http://ha.example:8123"})
+        seen = []
+        real = cfg._store_climate
+        cfg._store_climate = lambda c: (seen.append("store"), real(c))[1]
+        hook = lambda: seen.append(("hook", cfg._lock.locked()))  # noqa: E731
+        cfg.patch_climate({"enabled": True}, on_url_change=hook)               # same address: no call
+        cfg.patch_climate({"ha_url": "http://ha.example:8123/"}, on_url_change=hook)  # equivalent: no call
+        self.assertEqual(seen, ["store", "store"])
+        seen.clear()
+        cfg.patch_climate({"ha_url": "http://other.example:8123"}, on_url_change=hook)
+        self.assertEqual(seen, [("hook", True), "store"])
+        seen.clear()
+        with self.assertRaises(ClimateConfigError):  # invalid: neither hook nor write
+            cfg.patch_climate({"ha_url": "ftp://x"}, on_url_change=hook)
+        self.assertEqual(seen, [])
+
     def test_patch_climate_merges_onto_current(self):
         cfg = AppConfig(self.path)
         cfg.set_climate({**DEFAULT_CLIMATE, "ha_url": "http://ha.example:8123"})

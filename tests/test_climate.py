@@ -411,6 +411,16 @@ class TurnOnTest(unittest.TestCase):
         self.assertEqual(r.state(), "idle")
         self.assertIn("eingerichtet", r.status()["reason"])
 
+    def test_arming_without_a_client_leaves_no_stale_probe_behind(self):
+        r = Rig()
+        r.client_available = False
+        r.tick()                      # arming starts, but there is nobody to ask
+        r.advance(1)
+        self.assertFalse(r.ctrl._probe_arming)
+        r.client_available = True
+        r.advance(1)                  # still arming: Home Assistant must not be read before the end of it
+        self.assertEqual(r.client.log, [])
+
     def test_on_values_come_from_the_config(self):
         r = Rig(ac={"hvac_mode": "dry", "temperature": 22.5, "preset": "Powerful", "fan_mode": "3",
                     "horizontal": "center", "vertical": "up"})
