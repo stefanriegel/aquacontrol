@@ -4,10 +4,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from aquacontrol.auth import hash_password, hash_token, token_source, verify_password
 from aquacontrol.climate import DEFAULT_CLIMATE, ClimateConfigError
-from aquacontrol.config import (AppConfig, ConfigError, Secrets, load_daemon_config, update_daemon_config)
+from aquacontrol.config import (_atomic_write, AppConfig, ConfigError, Secrets, load_daemon_config, update_daemon_config)
 from aquacontrol.schedule import ScheduleError
 
 
@@ -105,6 +106,29 @@ class AppConfigTest(unittest.TestCase):
         self.path.write_text("{")
         with self.assertRaises(ConfigError):
             AppConfig(self.path)
+
+
+class AtomicWriteTest(unittest.TestCase):
+    def test_data_is_flushed_to_disk_before_the_rename(self):
+        """After a power loss a renamed but never synced file can be empty (secrets.json = silently no token)."""
+        calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            calls.append("fsync")
+            real_fsync(fd)
+
+        def replace(src, dst):
+            calls.append("replace")
+            real_replace(src, dst)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "x.json")
+            with mock.patch.object(os, "fsync", fsync), mock.patch.object(os, "replace", replace):
+                _atomic_write(path, {"a": 1})
+            self.assertEqual(json.loads(path.read_text()), {"a": 1})
+        self.assertEqual(calls[0], "fsync")
+        self.assertLess(calls.index("fsync"), calls.index("replace"))
 
 
 class SecretsTest(unittest.TestCase):

@@ -75,6 +75,8 @@ def _atomic_write(path: Path, data: dict, mode: int = 0o644, force_mode: bool = 
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())  # a renamed but never synced file can be empty after a power loss
         if force_mode:
             os.chmod(tmp, mode)
         elif path.exists():

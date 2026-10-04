@@ -162,8 +162,9 @@ def _url(v: object) -> str:
         raise ClimateConfigError("ha_url muss ein Text sein")
     if v == "":
         return ""
-    if not re.fullmatch(r"https?://[^\s/?#]+(/[^\s?#]*)?", v):
-        raise ClimateConfigError("ha_url muss mit http:// oder https:// beginnen, z. B. http://homeassistant.local:8123")
+    if not re.fullmatch(r"https?://[^\s/?#@]+(/[^\s?#]*)?", v):
+        raise ClimateConfigError("ha_url muss mit http:// oder https:// beginnen, z. B. http://homeassistant.local:8123 "
+                                 "(ohne Benutzer und Passwort)")
     return v.rstrip("/")
 
 

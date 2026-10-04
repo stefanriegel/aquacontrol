@@ -26,6 +26,7 @@ from .web import App, make_server
 log = logging.getLogger("aquacontrol")
 DEFAULT_DAEMON = "/etc/aquacontrol/daemon.json"
 DEFAULT_APP = "/var/lib/aquacontrol/config.json"
+SHUTDOWN_JOIN_S = 90  # systemd's default stop timeout; a switch-on talks to Home Assistant up to 8 times at 10 s each
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
 
@@ -110,7 +111,7 @@ def cmd_run(args) -> int:
             serving.join(15)
         for t in threads:
             if t.name in ("scheduler", "climate"):
-                t.join(15)
+                t.join(SHUTDOWN_JOIN_S)
         device.close()
         server.server_close()
     return 0

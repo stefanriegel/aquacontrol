@@ -95,15 +95,27 @@ class MainTest(unittest.TestCase):
         with socket.socket() as probe:  # a free port (the CLI treats 0 as "use the default")
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
+        joins = []
+        real_join = threading.Thread.join
+
+        def join(thread, timeout=None):
+            joins.append((thread.name, timeout))
+            return real_join(thread, timeout)
+
         threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
         with mock.patch.object(Device, "close", close), mock.patch.object(main_mod.Scheduler, "run", run), \
-                mock.patch.object(main_mod.ClimateController, "run", climate_run):
+                mock.patch.object(main_mod.ClimateController, "run", climate_run), \
+                mock.patch.object(threading.Thread, "join", join):
             rc = main_mod.main(["--daemon-config", str(self.daemon), "--app-config", str(self.app),
                                 "run", "--fake", str(FIXTURES), "--no-tls", "--listen", "127.0.0.1",
                                 "--port", str(port)])
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(events[:-1]), ["climate-stopped", "scheduler-stopped"])
         self.assertEqual(events[-1], "close")  # both threads are joined before the device goes away
+        # a Home Assistant call can take 10 s per request and a switch-on is a sequence of them: wait up to the
+        # 90 s systemd grants before giving up on the thread
+        self.assertEqual(sorted(t for t in joins if t[0] in ("scheduler", "climate")),
+                         [("climate", 90), ("scheduler", 90)])
 
     def test_signal_during_startup_still_stops_the_daemon(self):
         """SIGTERM/SIGINT arriving before serve_forever() (here: right after the server socket exists)

@@ -136,7 +136,9 @@ class ParseClimateConfigTest(unittest.TestCase):
         self.bad({"ac": {"vertical": "left"}}, "vertical")
 
     def test_ha_url(self):
-        for v in ("ftp://x", "ha", "http://", "javascript:alert(1)", "http://a b", 5, None):
+        for v in ("ftp://x", "ha", "http://", "javascript:alert(1)", "http://a b", 5, None,
+                  "http://user:pw@ha.example:8123", "http://user@ha.example", "http://ha.example:8123@evil.example",
+                  "https://@ha.example"):
             with self.subTest(v=v):
                 self.bad({"ha_url": v}, "ha_url")
         self.good({"ha_url": ""})
