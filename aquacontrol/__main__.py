@@ -43,9 +43,13 @@ def build(args) -> tuple[Device, Monitor, Scheduler, BackupStore, AppConfig, Ext
         transport = HidrawTransport()
         open_reader = HidrawReader
     device = Device(transport, backups, make_check(config.min_percent()))
-    externals = ExternalStore()
-    monitor = Monitor(open_reader, extra=lambda: read_host_sensors(config.host_sensor_labels()) + externals.current())
-    scheduler = Scheduler(device, config.rules)
+    try:
+        externals = ExternalStore()
+        monitor = Monitor(open_reader, extra=lambda: read_host_sensors(config.host_sensor_labels()) + externals.current())
+        scheduler = Scheduler(device, config.rules)
+    except BaseException:
+        device.close()  # the device exists: do not leave it open
+        raise
     return device, monitor, scheduler, backups, config, externals
 
 
@@ -75,30 +79,43 @@ def cmd_run(args) -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     device, monitor, scheduler, backups, config, externals = build(args)
-    climate, ha_client_factory = build_climate(monitor, config)
-    app = App(device, monitor, scheduler, backups, config, externals, daemon.password_hash,
-              daemon.push_tokens, args.static, climate=climate, ha_client_factory=ha_client_factory)
-    creds = os.environ.get("CREDENTIALS_DIRECTORY")
-    cert = key = None
-    if creds and not args.no_tls:
-        cert, key = os.path.join(creds, "cert"), os.path.join(creds, "key")
-    elif not args.no_tls:
-        log.error("kein Zertifikat (CREDENTIALS_DIRECTORY fehlt); nur mit --no-tls lokal testen")
-        return 2
-    host = args.listen or daemon.listen
-    port = args.port or daemon.port
-    server = make_server(app, host, port, cert, key)
-    threads = [threading.Thread(target=monitor.run, args=(stop,), name="monitor", daemon=True)]
-    if not args.no_schedule:
-        threads.append(threading.Thread(target=scheduler.run, args=(stop,), name="scheduler", daemon=True))
-    threads.append(threading.Thread(target=climate.run, args=(stop,), name="climate", daemon=True))
-    serving = threading.Thread(target=server.serve_forever, name="http", daemon=True)
-    started_serving = False
+    # From here on the device exists: every way out of this function closes it (see `finally`).
+    threads: list[threading.Thread] = []
+    server = serving = None
+    failure: list[BaseException] = []
     try:
+        climate, ha_client_factory = build_climate(monitor, config)
+        app = App(device, monitor, scheduler, backups, config, externals, daemon.password_hash,
+                  daemon.push_tokens, args.static, climate=climate, ha_client_factory=ha_client_factory)
+        creds = os.environ.get("CREDENTIALS_DIRECTORY")
+        cert = key = None
+        if creds and not args.no_tls:
+            cert, key = os.path.join(creds, "cert"), os.path.join(creds, "key")
+        elif not args.no_tls:
+            log.error("kein Zertifikat (CREDENTIALS_DIRECTORY fehlt); nur mit --no-tls lokal testen")
+            return 2
+        host = args.listen or daemon.listen
+        port = args.port or daemon.port
+        server = make_server(app, host, port, cert, key)
+        threads.append(threading.Thread(target=monitor.run, args=(stop,), name="monitor", daemon=True))
+        if not args.no_schedule:
+            threads.append(threading.Thread(target=scheduler.run, args=(stop,), name="scheduler", daemon=True))
+        threads.append(threading.Thread(target=climate.run, args=(stop,), name="climate", daemon=True))
+
+        def serve():
+            # A dead HTTP thread must not leave a daemon without an API running: stop everything and
+            # exit non-zero so systemd restarts the service.
+            try:
+                server.serve_forever()
+            except BaseException as e:
+                log.exception("HTTP-Server abgestürzt, Dienst wird beendet")
+                failure.append(e)
+                stop.set()
+
+        serving = threading.Thread(target=serve, name="http", daemon=True)
         for t in threads:
             t.start()
         serving.start()
-        started_serving = True
         log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
         stop.wait()  # a signal that came earlier has already set it
     finally:
@@ -106,15 +123,17 @@ def cmd_run(args) -> int:
         # write (scheduler or request thread) finishes before the process exits; the climate thread only
         # talks to Home Assistant, but is joined too so no switch is cut off half way.
         stop.set()
-        if started_serving:
+        if serving is not None and serving.is_alive() and not failure:  # shutdown() waits for a live serve loop
             server.shutdown()
+        if serving is not None and serving.ident is not None:
             serving.join(15)
         for t in threads:
-            if t.name in ("scheduler", "climate"):
+            if t.name in ("scheduler", "climate") and t.ident is not None:
                 t.join(SHUTDOWN_JOIN_S)
         device.close()
-        server.server_close()
-    return 0
+        if server is not None:
+            server.server_close()
+    return 1 if failure else 0
 
 
 def cmd_set_password(args) -> int:

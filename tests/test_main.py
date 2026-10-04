@@ -145,5 +145,71 @@ sys.exit(m.main(["--daemon-config", sys.argv[2], "--app-config", sys.argv[3], "r
                 self.assertEqual(proc.returncode, 0, proc.stderr.decode())
 
 
+class RunFailureTest(unittest.TestCase):
+    """The daemon must not linger half-dead (no HTTP) and must release the device on every failure path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.daemon = Path(self.tmp.name, "daemon.json")
+        self.daemon.write_text(json.dumps({"password_hash": hash_password("langes-passwort", iterations=1000)}))
+        self.app = Path(self.tmp.name, "config.json")
+        self.app.write_text(json.dumps({"backup_dir": str(Path(self.tmp.name, "b")), "schedule": []}))
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        self.closed = []
+        real_close = Device.close
+
+        def close(dev):
+            self.closed.append(dev)
+            real_close(dev)
+
+        patcher = mock.patch.object(Device, "close", close)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_daemon(self, *extra):
+        argv = ["--daemon-config", str(self.daemon), "--app-config", str(self.app), "run", "--fake", str(FIXTURES),
+                "--listen", "127.0.0.1", "--port", "0", *extra]
+        return main_mod.main(argv)
+
+    def test_a_crashed_http_thread_stops_the_daemon_with_a_failure(self):
+        real = main_mod.make_server
+
+        def make_server(*a, **k):
+            server = real(*a, **k)
+            server.serve_forever = mock.Mock(side_effect=RuntimeError("boom"))
+            return server
+
+        timer = threading.Timer(20, os.kill, (os.getpid(), signal.SIGTERM))  # safety net: a hang ends as rc 0
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with mock.patch.object(main_mod, "make_server", make_server), \
+                self.assertLogs("aquacontrol", level="ERROR") as logs:
+            rc = self.run_daemon("--no-tls")
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.closed), 1)  # the normal shutdown ran
+        self.assertIn("boom", "\n".join(logs.output))
+
+    def test_device_is_closed_when_the_server_cannot_be_created(self):
+        with mock.patch.object(main_mod, "make_server", side_effect=OSError("Address already in use")), \
+                self.assertRaises(OSError):
+            self.run_daemon("--no-tls")
+        self.assertEqual(len(self.closed), 1)
+
+    def test_device_is_closed_when_build_fails_after_the_device_exists(self):
+        with mock.patch.object(main_mod, "Scheduler", side_effect=ValueError("bad rules")), \
+                self.assertRaises(ValueError):
+            self.run_daemon("--no-tls")
+        self.assertEqual(len(self.closed), 1)
+
+    def test_device_is_closed_when_the_certificate_is_missing(self):
+        with mock.patch.dict(os.environ, {}, clear=False), self.assertLogs("aquacontrol", level="ERROR"):
+            os.environ.pop("CREDENTIALS_DIRECTORY", None)
+            rc = self.run_daemon()
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(self.closed), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
