@@ -1,0 +1,106 @@
+"""Display-only temperatures: host hwmon sensors and values pushed by other machines."""
+from __future__ import annotations
+
+import math
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+EXTERNAL_MAX_SENSORS = 32
+EXTERNAL_MAX_AGE_S = 30.0
+EXTERNAL_UNITS = ("°C", "W", "%")
+_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+@dataclass(frozen=True)
+class Reading:
+    id: str        # "k10temp/Tctl" or "llm-vm/gpu0"
+    label: str
+    value: float
+    unit: str
+
+
+def _natural(path: Path) -> tuple[str, int]:
+    m = re.match(r"^(\D*)(\d*)$", path.name)
+    return (m.group(1), int(m.group(2) or 0)) if m else (path.name, 0)
+
+
+def read_host_sensors(labels: dict[str, str | None], sys_root: str | Path = "/sys/class/hwmon") -> list[Reading]:
+    """All hwmon temperatures except the QUADRO's. `labels` renames (str) or hides (None)."""
+    out: list[Reading] = []
+    root = Path(sys_root)
+    if not root.is_dir():
+        return out
+    for hw in sorted(root.iterdir(), key=_natural):
+        try:
+            name = (hw / "name").read_text().strip()
+        except OSError:
+            continue
+        if name == "quadro":
+            continue
+        for inp in sorted(hw.glob("temp*_input"), key=lambda f: _natural(Path(f.name.removesuffix("_input")))):
+            chan = inp.name.removesuffix("_input")
+            try:
+                label = (hw / f"{chan}_label").read_text().strip()
+            except OSError:
+                label = chan
+            sid = f"{name}/{label}"
+            if sid in labels and labels[sid] is None:
+                continue
+            try:
+                value = int(inp.read_text().strip()) / 1000
+            except (OSError, ValueError):
+                continue  # e.g. ENODATA for an unconnected sensor
+            out.append(Reading(sid, labels.get(sid) or sid, value, "°C"))
+    return out
+
+
+class ExternalError(ValueError):
+    pass
+
+
+class ExternalStore:
+    """Latest values pushed per source; entries older than EXTERNAL_MAX_AGE_S count as missing."""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._data: dict[str, tuple[float, list[Reading]]] = {}
+
+    def put(self, source: str, payload: object) -> int:
+        if not isinstance(payload, dict) or payload.get("source") != source:
+            raise ExternalError("source im Body passt nicht zum Token")
+        sensors = payload.get("sensors")
+        if not isinstance(sensors, list) or not 0 < len(sensors) <= EXTERNAL_MAX_SENSORS:
+            raise ExternalError(f"sensors muss eine Liste mit 1–{EXTERNAL_MAX_SENSORS} Einträgen sein")
+        readings = []
+        for s in sensors:
+            if not isinstance(s, dict):
+                raise ExternalError("Sensor-Eintrag muss ein Objekt sein")
+            sid, label, value, unit = s.get("id"), s.get("label", s.get("id")), s.get("value"), s.get("unit")
+            if not isinstance(sid, str) or not _ID_RE.match(sid):
+                raise ExternalError(f"ungültige Sensor-id {sid!r}")
+            if not isinstance(label, str) or len(label) > 40:
+                raise ExternalError(f"ungültiges label für {sid}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                    or not -50 <= value <= 1000:
+                raise ExternalError(f"ungültiger Wert für {sid}")
+            if unit not in EXTERNAL_UNITS:
+                raise ExternalError(f"Einheit für {sid} muss eine von {EXTERNAL_UNITS} sein")
+            readings.append(Reading(f"{source}/{sid}", label, float(value), unit))
+        with self._lock:
+            self._data[source] = (self._clock(), readings)
+        return len(readings)
+
+    def current(self) -> list[Reading]:
+        now = self._clock()
+        with self._lock:
+            return [r for ts, rs in self._data.values() if now - ts <= EXTERNAL_MAX_AGE_S for r in rs]
+
+    def sources(self) -> dict[str, float]:
+        """Age in seconds of the last push per source."""
+        now = self._clock()
+        with self._lock:
+            return {src: now - ts for src, (ts, _) in self._data.items()}
