@@ -12,8 +12,8 @@ temperatures (host hwmon sensors, values pushed from other machines) for referen
 - Talks to the device via Linux `hidraw` (feature report 0x03 = settings, input report 0x01 = live data)
 - No schedule rules are installed by default, so a fresh install never writes to the device on its own; add rules in the UI
 - The commit report is sent as a HID feature report like the kernel driver (`commit_as="output"` on `HidrawTransport` switches to an output report)
-- Every write: fresh read → CRC check → backup → write → commit → read-back verify → rollback on mismatch
-- Backups: fan changes and restores create a backup first; LED strip and schedule changes do not (by design, they are frequent and harmless)
+- Every write to the device: fresh read → CRC check → backup (except LED strip changes, see below) → write → commit → read-back verify → rollback on mismatch
+- Backups: fan changes, LED editor changes and restores create a backup first. LED strip on/off and brightness changes (made by the scheduler or a manual override) create none (by design, they are frequent and harmless); saving schedule rules does not write to the device at all
 
 > Protocol knowledge builds on [TimSC/quadroctl](https://github.com/TimSC/quadroctl) and the
 > [aquacomputer_d5next hwmon driver](https://github.com/aleksamagicka/aquacomputer_d5next-hwmon).
