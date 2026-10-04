@@ -76,3 +76,17 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-
 .climate-state { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .climate-lines { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
+
+.led-card h3 .hint { font-weight: normal; }
+svg.led-bar { width: 100%; max-width: 560px; height: auto; display: block; margin-bottom: 4px; }
+svg.led-bar .now-marker { stroke: var(--warn); stroke-width: 2; stroke-dasharray: 3 2; }
+svg.led-bar text.now-text { fill: var(--warn); font-weight: 600; }
+.led-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; }
+.led-chain input[type=number] { width: 70px; }
+.led-chain input[type=color] { width: 44px; height: 32px; padding: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+.led-lt { color: var(--muted); }
+.led-buttons { display: flex; gap: 8px; margin: 4px 0; }
+.led-toggles { display: flex; flex-wrap: wrap; gap: 0 18px; }
+.led-card p.msg:empty { display: none; }
+.led-card button:disabled { opacity: 0.5; cursor: default; }
+.led-card select { width: 220px; max-width: 100%; }

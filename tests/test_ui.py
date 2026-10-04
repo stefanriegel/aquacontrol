@@ -58,6 +58,80 @@ class FanSaveBodyTest(unittest.TestCase):
         self.assertNotIn("mode", self.body(mode="raw-7"))  # display-only modes are never sent
 
 
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class LedUiTest(unittest.TestCase):
+    """Pure helpers of the LEDs tab (the DOM building itself is covered by looking at it)."""
+
+    RANGE = [20, 70]
+    COLORS = ["#00ff00", "#ffff00", "#ff0000"]
+
+    def test_save_body_of_a_colour_switch(self):
+        v = {"mode": "farbschalter", "thresholds": [35, 45], "colors": self.COLORS, "fade": True, "blink": False,
+             "brightness": True, "source": 2, "sourceChanged": False}
+        self.assertEqual(run_js("ledSaveBody", [v]), {
+            "thresholds": [35, 45], "colors": self.COLORS, "fade": True, "blink": False,
+            "brightness_by_source": True})  # the source is only sent after the user picked one
+        self.assertEqual(run_js("ledSaveBody", [{**v, "sourceChanged": True}])["source"], 2)
+
+    def test_save_body_of_a_static_colour_has_no_thresholds_or_source(self):
+        v = {"mode": "statisch", "thresholds": [], "colors": ["#00ff00"], "fade": False, "blink": True,
+             "brightness": False, "source": -1, "sourceChanged": True}
+        self.assertEqual(run_js("ledSaveBody", [v]), {"colors": ["#00ff00"], "fade": False, "blink": True,
+                                                       "brightness_by_source": False})
+
+    def test_segments_cover_the_range_with_the_colours(self):
+        segs = run_js("ledSegments", [self.RANGE, [35, 45], self.COLORS])
+        self.assertEqual(segs, [{"from": 20, "to": 35, "color": "#00ff00"}, {"from": 35, "to": 45, "color": "#ffff00"},
+                                {"from": 45, "to": 70, "color": "#ff0000"}])
+
+    def test_segments_clamp_thresholds_into_the_range_and_keep_them_ordered(self):
+        segs = run_js("ledSegments", [self.RANGE, [10, 90], self.COLORS])
+        self.assertEqual([(g["from"], g["to"]) for g in segs], [(20, 20), (20, 70), (70, 70)])
+        segs = run_js("ledSegments", [self.RANGE, [50, 40], self.COLORS])
+        self.assertEqual([(g["from"], g["to"]) for g in segs], [(20, 50), (50, 50), (50, 70)])
+
+    def test_fraction_is_clamped(self):
+        self.assertEqual(run_js("ledFraction", [45, self.RANGE]), 0.5)
+        self.assertEqual(run_js("ledFraction", [10, self.RANGE]), 0)
+        self.assertEqual(run_js("ledFraction", [99, self.RANGE]), 1)
+        self.assertEqual(run_js("ledFraction", [5, [5, 5]]), 0)
+
+    def test_new_threshold_goes_between_the_last_one_and_the_end(self):
+        self.assertEqual(run_js("ledNewThreshold", [[35, 45], self.RANGE]), 57)
+        self.assertEqual(run_js("ledNewThreshold", [[35, 69], self.RANGE]), 70)
+        self.assertIsNone(run_js("ledNewThreshold", [[35, 70], self.RANGE]))
+
+    def test_problem_texts(self):
+        problem = lambda t: run_js("ledProblem", [t, self.RANGE])
+        self.assertEqual(problem([35, 45]), "")
+        self.assertIn("streng steigen", problem([45, 45]))
+        self.assertIn("zwischen 20 und 70", problem([10, 45]))
+        self.assertIn("ganze Zahlen", problem([35.5, 45]))
+        self.assertIn("ganze Zahlen", problem([None, 45]))
+
+    def test_source_options_name_the_four_sensors(self):
+        opts = run_js("ledSourceOptions", [["Wasser", "Luft", "T3", "T4"], 0, "Wasser"])
+        self.assertEqual(opts, [{"value": 0, "label": "1: Wasser", "disabled": False},
+                                {"value": 1, "label": "2: Luft", "disabled": False},
+                                {"value": 2, "label": "3: T3", "disabled": False},
+                                {"value": 3, "label": "4: T4", "disabled": False}])
+
+    def test_other_sources_are_shown_but_not_selectable(self):
+        opts = run_js("ledSourceOptions", [["Wasser", "Luft", "T3", "T4"], 4, "Durchfluss"])
+        self.assertEqual(opts[0], {"value": 4, "label": "Durchfluss (nur Anzeige)", "disabled": True})
+        self.assertEqual(len(opts), 5)
+
+    def test_tab_markup(self):
+        html = (APP_JS.parent / "index.html").read_text()
+        self.assertIn('id="led-list"', html)
+        src = APP_JS.read_text()
+        self.assertIn('type: "color"', src)
+        self.assertIn("+ Schwelle", src)
+        self.assertIn("− Schwelle", src)
+        for text in ("Überblenden", "Blinken", "Helligkeit nach Datenquelle"):
+            self.assertIn(text, src)
+
+
 FIELDS = [
     {"group": "Home Assistant"},
     {"path": "enabled", "kind": "bool"},

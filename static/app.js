@@ -86,6 +86,7 @@ async function refreshStatus() {
     if (age > 30) sensors.append(tile(src, "keine Daten", `letzter Push vor ${Math.round(age)} s`, true));
   }
   if (fanEditorsReady) updateOperatingPoints();
+  updateLedMarkers();
 }
 
 function tile(label, value, sub = "", stale = false) {
@@ -346,6 +347,182 @@ function updateOperatingPoints() {
 }
 
 // ---------------------------------------------------------------- LEDs
+const ledStates = [];
+
+// Request body for saving one LED controller. The source is only sent once the user picked one, so a source
+// that is shown but not selectable (flow, software sensor) is never rewritten by an unrelated save.
+function ledSaveBody(v) {
+  const body = { colors: v.colors, fade: v.fade, blink: v.blink, brightness_by_source: v.brightness };
+  if (v.mode === "farbschalter") {
+    body.thresholds = v.thresholds;
+    if (v.sourceChanged) body.source = v.source;
+  }
+  return body;
+}
+
+// Colour bands of the preview bar: [{from, to, color}] over the source range, thresholds clamped into it.
+function ledSegments(range, thresholds, colors) {
+  const [lo, hi] = range;
+  const edges = [lo];
+  for (const t of thresholds) edges.push(Math.max(edges[edges.length - 1], Math.min(hi, Math.max(lo, t))));
+  edges.push(hi);
+  return colors.map((color, i) => ({ from: edges[i], to: edges[Math.min(i + 1, edges.length - 1)], color }));
+}
+
+function ledFraction(value, range) {
+  const [lo, hi] = range;
+  if (!(hi > lo)) return 0;
+  return Math.min(1, Math.max(0, (value - lo) / (hi - lo)));
+}
+
+// A start value for "+ Schwelle": between the last threshold and the end of the range, or null if there is no room.
+function ledNewThreshold(thresholds, range) {
+  const last = thresholds[thresholds.length - 1];
+  const next = Math.max(last + 1, Math.floor((last + range[1]) / 2));
+  return next <= range[1] ? next : null;
+}
+
+// "" if the thresholds would be accepted, otherwise the reason (same rules as the server).
+function ledProblem(thresholds, range) {
+  if (!thresholds.every((t) => Number.isInteger(t))) return "Schwellen müssen ganze Zahlen sein.";
+  if (thresholds.some((t, i) => i > 0 && t <= thresholds[i - 1])) return "Schwellen müssen streng steigen.";
+  if (thresholds.some((t) => t < range[0] || t > range[1])) return `Schwellen müssen zwischen ${range[0]} und ${range[1]} liegen.`;
+  return "";
+}
+
+// Drop-down entries for the data source: the four temperature sensors; any other current source is shown, not selectable.
+function ledSourceOptions(sensorNames, source, sourceName) {
+  const opts = sensorNames.map((n, i) => ({ value: i, label: `${i + 1}: ${n}`, disabled: false }));
+  if (!sensorNames.some((_, i) => i === source)) opts.unshift({ value: source, label: `${sourceName} (nur Anzeige)`, disabled: true });
+  return opts;
+}
+
+function ledPreview(state) {
+  const W = 400, X0 = 6, X1 = 394, Y = 26, H = 20;
+  const bar = state.preview;
+  bar.replaceChildren();
+  const x = (v) => X0 + ledFraction(v, state.led.range) * (X1 - X0);
+  for (const seg of ledSegments(state.led.range, state.thresholds, state.colors)) {
+    bar.append(svg("rect", { x: x(seg.from), y: Y, width: Math.max(0, x(seg.to) - x(seg.from)), height: H, fill: seg.color }));
+  }
+  bar.append(svg("rect", { x: X0, y: Y, width: X1 - X0, height: H, fill: "none", stroke: "currentColor", "stroke-opacity": 0.35 }));
+  const label = (v, anchor, cls = "") => {
+    const t = svg("text", { x: x(v), y: 62, "text-anchor": anchor, class: cls });
+    t.textContent = String(v);
+    bar.append(t);
+  };
+  label(state.led.range[0], "start");
+  label(state.led.range[1], "end");
+  for (const t of state.thresholds) {
+    if (!Number.isFinite(t)) continue;
+    bar.append(svg("line", { x1: x(t), x2: x(t), y1: Y - 3, y2: Y + H + 3, stroke: "currentColor", "stroke-width": 2 }));
+    label(t, "middle");
+  }
+  const now = state.now;
+  if (now !== undefined && now !== null) {
+    bar.append(svg("line", { x1: x(now), x2: x(now), y1: 17, y2: Y + H + 6, class: "now-marker" }));
+    const t = svg("text", { x: Math.min(W - 24, Math.max(24, x(now))), y: 12, "text-anchor": "middle", class: "now-text" });
+    t.textContent = `${now.toFixed(1)} °C`;
+    bar.append(t);
+  }
+}
+
+function updateLedMarkers() {
+  const temps = lastStatus && lastStatus.status ? lastStatus.status.temps : null;
+  for (const state of ledStates) {
+    const v = temps && state.led.mode_name === "farbschalter" && state.source >= 0 && state.source < temps.length ? temps[state.source] : null;
+    const now = v === null || v === undefined ? undefined : v;
+    if (now !== state.now) {
+      state.now = now;
+      ledPreview(state);
+    }
+  }
+}
+
+function ledCard(led, sensorNames) {
+  const isSwitch = led.mode_name === "farbschalter";
+  const state = { led, thresholds: [...led.thresholds], colors: [...led.colors], source: led.source, sourceChanged: false,
+    preview: svg("svg", { class: "led-bar", viewBox: "0 0 400 68", role: "img", "aria-label": "Vorschau der Farben" }) };
+  ledStates.push(state);
+  const msg = el("span", { class: "msg" });
+  const save = el("button", { class: "primary" }, "Speichern");
+  const problem = el("p", { class: "msg err" });
+  const chain = el("div", { class: "led-chain" });
+  const toggles = {};
+  const toggle = (key, text) => {
+    toggles[key] = el("input", { type: "checkbox", checked: led.flags[key] });
+    return el("label", { class: "strip-row" }, toggles[key], text);
+  };
+
+  const refresh = () => {
+    const p = isSwitch ? ledProblem(state.thresholds, led.range) : "";
+    problem.textContent = p;
+    save.disabled = p !== "";
+    ledPreview(state);
+  };
+  const build = () => {  // rebuilt when the number of thresholds changes
+    chain.replaceChildren();
+    state.colors.forEach((color, k) => {
+      const c = el("input", { type: "color", value: color, "aria-label": `Farbe ${k + 1}` });
+      c.addEventListener("input", () => { state.colors[k] = c.value; ledPreview(state); });
+      chain.append(c);
+      if (isSwitch && k < state.thresholds.length) {
+        const t = el("input", { type: "number", step: 1, min: led.range[0], max: led.range[1], value: state.thresholds[k], "aria-label": `Schwelle ${k + 1}` });
+        t.addEventListener("input", () => { state.thresholds[k] = t.value === "" ? NaN : Number(t.value); refresh(); });
+        chain.append(el("span", { class: "led-lt" }, "<"), t);
+        chain.append(el("span", { class: "led-lt" }, "<"));
+      }
+    });
+    add.disabled = state.thresholds.length >= 5 || ledNewThreshold(state.thresholds, led.range) === null;
+    remove.disabled = state.thresholds.length <= 1;
+    refresh();
+  };
+  const add = el("button", {}, "+ Schwelle");
+  add.addEventListener("click", () => {
+    state.thresholds.push(ledNewThreshold(state.thresholds, led.range));
+    state.colors.push(state.colors[state.colors.length - 1]);
+    build();
+  });
+  const remove = el("button", {}, "− Schwelle");
+  remove.addEventListener("click", () => {
+    state.thresholds.pop();
+    state.colors.pop();
+    build();
+  });
+
+  const source = el("select", {}, ...ledSourceOptions(sensorNames, led.source, led.source_name)
+    .map((o) => el("option", { value: o.value, selected: o.value === led.source, disabled: o.disabled }, o.label)));
+  source.addEventListener("change", () => { state.source = Number(source.value); state.sourceChanged = true; updateLedMarkers(); });
+
+  save.addEventListener("click", async () => {
+    const body = ledSaveBody({ mode: led.mode_name, thresholds: state.thresholds, colors: state.colors,
+      fade: toggles.fade.checked, blink: toggles.blink.checked, brightness: toggles.brightness_by_source.checked,
+      source: state.source, sourceChanged: state.sourceChanged });
+    save.disabled = true;
+    try {
+      showMsg(msg, savedText(await api("PUT", `/api/settings/led/${led.index}`, body)), true);
+    } catch (e) {
+      showMsg(msg, e.message, false);
+    } finally {
+      refresh();
+    }
+  });
+
+  const card = el("div", { class: "card led-card" },
+    el("h3", {}, `${led.index}: ${led.name}`,
+      el("span", { class: "hint" }, ` · LED ${led.led_start + 1}–${led.led_start + led.led_count} · ${isSwitch ? "Farbschalter" : "Statische Farbe"}`)),
+    isSwitch ? state.preview : "",
+    chain,
+    isSwitch ? el("div", { class: "led-buttons" }, add, remove) : "",
+    problem,
+    el("div", { class: "led-toggles" }, toggle("fade", "Überblenden"), toggle("blink", "Blinken"),
+      toggle("brightness_by_source", "Helligkeit nach Datenquelle")),
+    isSwitch ? el("label", { class: "strip-row" }, "Datenquelle", source) : "",
+    el("div", { class: "strip-actions" }, save, msg));
+  build();
+  return card;
+}
+
 loaders.leds = async () => {
   let settings;
   try {
@@ -359,9 +536,16 @@ loaders.leds = async () => {
   $("#strip-bright-val").textContent = settings.strip.brightness;
   const list = $("#led-list");
   list.replaceChildren();
-  for (const led of settings.leds.filter((l) => l.led_count > 1)) {
-    list.append(tile(`${led.index}: ${led.name}`, `LED ${led.led_start}–${led.led_start + led.led_count - 1}`, `Modus ${led.mode}`));
+  ledStates.length = 0;
+  const readOnly = el("div", { class: "grid" });
+  for (const led of settings.leds) {
+    if (led.mode_name === "unbenutzt") continue;  // unused controllers are not shown
+    if (led.editable) list.append(ledCard(led, settings.sensors));
+    else readOnly.append(tile(`${led.index}: ${led.name}`, `LED ${led.led_start + 1}–${led.led_start + led.led_count}`, `Modus ${led.mode} (nur Anzeige)`));
   }
+  if (readOnly.children.length) list.append(readOnly);
+  if (!list.children.length) list.append(el("p", { class: "hint" }, "Keine LED-Controller in Benutzung."));
+  updateLedMarkers();
 };
 $("#strip-bright").addEventListener("input", () => { $("#strip-bright-val").textContent = $("#strip-bright").value; });
 $("#strip-save").addEventListener("click", async () => {
