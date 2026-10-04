@@ -643,7 +643,22 @@ $("#rules-save").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------- climate
-const HVAC_LABELS = { cool: "Kühlen (cool)", dry: "Entfeuchten (dry)", fan_only: "Nur Lüfter (fan_only)" };
+// German display texts for the values Home Assistant reports. The option value stays the raw HA value;
+// anything not listed is shown as it is.
+const HVAC_LABELS = { cool: "Kühlen", dry: "Entfeuchten", fan_only: "Nur Lüfter" };
+const PRESET_LABELS = { Normal: "Normal", Quiet: "Leise", Powerful: "Leistung" };
+const HORIZONTAL_LABELS = { auto: "Automatisch", left: "Ganz links", left_center: "Links-Mitte", center: "Mitte", right_center: "Rechts-Mitte", right: "Ganz rechts" };
+const VERTICAL_LABELS = { swing: "Schwenken", auto: "Automatisch", up: "Oben", up_center: "Oben-Mitte", center: "Mitte", down_center: "Unten-Mitte", down: "Unten" };
+function fanModeLabel(v) {
+  if (v === "Automatic") return "Automatisch";
+  return /^\d+$/.test(v) ? `Stufe ${v}` : undefined;
+}
+// {id: "Name (id)"} for the entities Home Assistant gave a friendly name; the others show just the id.
+function entityLabels(pairs) {
+  const labels = {};
+  for (const p of pairs || []) if (p && typeof p.id === "string" && typeof p.name === "string" && p.name) labels[p.id] = `${p.name} (${p.id})`;
+  return labels;
+}
 // Everything with a fixed set of valid values is a drop-down filled from GET /api/climate/options (`list` names
 // the key of that response). Only the address, numbers and the token are typed.
 const CLIMATE_FIELDS = [
@@ -651,9 +666,9 @@ const CLIMATE_FIELDS = [
   { path: "enabled", label: "Klima-Automatik aktiviert", kind: "bool" },
   { path: "ha_url", label: "Adresse", kind: "text", placeholder: "http://homeassistant.local:8123" },
   { kind: "token", label: "Zugangs-Token" },
-  { path: "entity_id", label: "Klimaanlage (Entity)", kind: "select", list: "climate_entities", wide: true, reload: true },
-  { path: "horizontal_select", label: "Lamellen horizontal (Select)", kind: "select", list: "select_entities", wide: true, reload: true },
-  { path: "vertical_select", label: "Lamellen vertikal (Select)", kind: "select", list: "select_entities", wide: true, reload: true },
+  { path: "entity_id", label: "Klimaanlage (Entity)", kind: "select", list: "climate_entities", names: "climate_entity_names", wide: true, reload: true },
+  { path: "horizontal_select", label: "Lamellen horizontal (Select)", kind: "select", list: "select_entities", names: "select_entity_names", wide: true, reload: true },
+  { path: "vertical_select", label: "Lamellen vertikal (Select)", kind: "select", list: "select_entities", names: "select_entity_names", wide: true, reload: true },
   { group: "Einschalten, wenn alles ununterbrochen gilt" },
   { path: "on.water_c", label: "Wasser mindestens °C", kind: "number", min: 0, max: 100, step: 0.5 },
   { path: "on.fan_percent", label: "Lüfter mindestens %", kind: "number", min: 0, max: 100, step: 1 },
@@ -670,18 +685,20 @@ const CLIMATE_FIELDS = [
   { group: "Klimaanlage beim Einschalten" },
   { path: "ac.hvac_mode", label: "Betriebsart", kind: "select", list: "hvac_modes", labels: HVAC_LABELS },
   { path: "ac.temperature", label: "Solltemperatur °C", kind: "number", min: 16, max: 30, step: 0.5 },
-  { path: "ac.preset", label: "Preset", kind: "select", list: "preset_modes" },
-  { path: "ac.fan_mode", label: "Lüfterstufe", kind: "select", list: "fan_modes" },
-  { path: "ac.horizontal", label: "Lamellen horizontal", kind: "select", list: "horizontal" },
-  { path: "ac.vertical", label: "Lamellen vertikal", kind: "select", list: "vertical" },
+  { path: "ac.preset", label: "Preset", kind: "select", list: "preset_modes", labels: PRESET_LABELS },
+  { path: "ac.fan_mode", label: "Lüfterstufe", kind: "select", list: "fan_modes", labels: fanModeLabel },
+  { path: "ac.horizontal", label: "Lamellen horizontal", kind: "select", list: "horizontal", labels: HORIZONTAL_LABELS },
+  { path: "ac.vertical", label: "Lamellen vertikal", kind: "select", list: "vertical", labels: VERTICAL_LABELS },
 ];
 const STATE_TEXT = { idle: "Bereit", arming: "Einschalt-Bedingung läuft", owned: "Von aquacontrol eingeschaltet",
   cooldown: "Pause / Sperrzeit", disabled: "Deaktiviert" };
 
 // [value, label] pairs for a drop-down. The saved value stays selectable even if the list lacks it (marked).
+// `labels` is an object {value: text} or a function value -> text (undefined = show the raw value).
 function choiceOptions(list, saved, labels = {}) {
-  const items = [...new Set(list)].map((v) => [v, labels[v] || v]);
-  if (saved !== null && saved !== undefined && saved !== "" && !list.includes(saved)) items.unshift([saved, `${labels[saved] || saved} (gespeichert)`]);
+  const text = (v) => (typeof labels === "function" ? labels(v) : labels[v]) || v;
+  const items = [...new Set(list)].map((v) => [v, text(v)]);
+  if (saved !== null && saved !== undefined && saved !== "" && !list.includes(saved)) items.unshift([saved, `${text(saved)} (gespeichert)`]);
   return items;
 }
 
@@ -796,7 +813,8 @@ function buildClimateForm() {
       let saved = null;
       const fill = () => {
         const current = input.value;
-        input.replaceChildren(...choiceOptions((climateOptions && climateOptions[f.list]) || [], saved, f.labels).map(([v, t]) => el("option", { value: v }, t)));
+        const labels = f.names ? entityLabels(climateOptions && climateOptions[f.names]) : f.labels;
+        input.replaceChildren(...choiceOptions((climateOptions && climateOptions[f.list]) || [], saved, labels).map(([v, t]) => el("option", { value: v }, t)));
         if ([...input.options].some((o) => o.value === current)) input.value = current;
       };
       climateInputs[f.path] = { read: () => input.value, write: (v) => { saved = v; fill(); input.value = String(v); }, refill: fill };

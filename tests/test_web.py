@@ -845,6 +845,25 @@ class WebTest(unittest.TestCase):
         self.assertEqual(self.ha.calls, [])
         self.assertNotIn(self.TOKEN, json.dumps(resp))
 
+    def test_climate_options_carry_friendly_names_next_to_the_id_lists(self):
+        self.configure_ha()
+        self.fill_ha()
+        self.ha.states[CLIMATE_ENTITY]["attributes"]["friendly_name"] = "Klima Wohnzimmer"
+        self.ha.extra_states["climate.bedroom"]["attributes"]["friendly_name"] = 7  # not a name
+        self.ha.states[HSEL]["attributes"]["friendly_name"] = "Lamellen waagerecht"
+        self.ha.extra_states["select.bedroom_swing_horizontal"]["attributes"]["friendly_name"] = ""
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual(resp["climate_entities"], ["climate.bedroom", CLIMATE_ENTITY])  # the id lists are unchanged
+        self.assertEqual(resp["climate_entity_names"], [{"id": "climate.bedroom", "name": None},
+                                                        {"id": CLIMATE_ENTITY, "name": "Klima Wohnzimmer"}])
+        self.assertEqual(resp["select_entity_names"], [
+            {"id": "select.bedroom_swing_horizontal", "name": None}, {"id": HSEL, "name": "Lamellen waagerecht"},
+            {"id": VSEL, "name": None}])
+
+    def test_climate_options_without_home_assistant_have_empty_name_lists(self):
+        status, resp = self.req("GET", "/api/climate/options")
+        self.assertEqual((resp["climate_entity_names"], resp["select_entity_names"]), ([], []))
+
     def test_climate_options_list_every_select_when_none_mentions_swing(self):
         self.configure_ha()
         self.fill_ha()

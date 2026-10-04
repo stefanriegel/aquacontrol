@@ -217,10 +217,45 @@ class ClimateChoicesTest(unittest.TestCase):
         self.assertEqual(run_js("choiceOptions", [["a", "a", "b"], "a"]), [["a", "a"], ["b", "b"]])
 
     def test_options_can_have_nicer_labels(self):
-        self.assertEqual(run_js("choiceOptions", [["cool", "dry"], "dry", {"cool": "Kühlen (cool)"}]),
-                         [["cool", "Kühlen (cool)"], ["dry", "dry"]])
+        self.assertEqual(run_js("choiceOptions", [["cool", "dry"], "dry", {"cool": "Kühlen"}]),
+                         [["cool", "Kühlen"], ["dry", "dry"]])
         self.assertEqual(run_js("choiceOptions", [["cool"], "fan_only", {"fan_only": "Nur Lüfter"}]),
                          [["fan_only", "Nur Lüfter (gespeichert)"], ["cool", "cool"]])
+
+    def labelled(self, label_const, values):
+        """Display text per raw value for one of the label tables (an object or the fan function)."""
+        script = js_chunks(label_const) + \
+            f"\nconsole.log(JSON.stringify(JSON.parse(process.argv[1]).map((v) => " \
+            f"(typeof {label_const} === 'function' ? {label_const}(v) : {label_const}[v]) || v)));"
+        out = subprocess.run(["node", "-e", script, json.dumps(values)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_ha_option_values_are_shown_in_german_but_keep_their_raw_value(self):
+        self.assertEqual(self.labelled("HVAC_LABELS", ["cool", "dry", "fan_only", "heat"]),
+                         ["Kühlen", "Entfeuchten", "Nur Lüfter", "heat"])
+        self.assertEqual(self.labelled("PRESET_LABELS", ["Normal", "Quiet", "Powerful", "Eco"]),
+                         ["Normal", "Leise", "Leistung", "Eco"])
+        self.assertEqual(self.labelled("fanModeLabel", ["Automatic", "1", "5", "10", "Turbo"]),
+                         ["Automatisch", "Stufe 1", "Stufe 5", "Stufe 10", "Turbo"])
+        self.assertEqual(self.labelled("HORIZONTAL_LABELS", ["auto", "left", "left_center", "center", "right_center",
+                                                              "right", "wide"]),
+                         ["Automatisch", "Ganz links", "Links-Mitte", "Mitte", "Rechts-Mitte", "Ganz rechts", "wide"])
+        self.assertEqual(self.labelled("VERTICAL_LABELS", ["swing", "auto", "up", "up_center", "center", "down_center",
+                                                            "down", "x"]),
+                         ["Schwenken", "Automatisch", "Oben", "Oben-Mitte", "Mitte", "Unten-Mitte", "Unten", "x"])
+
+    def test_options_accept_a_label_function(self):
+        script = js_chunks("choiceOptions", "fanModeLabel") + \
+            '\nconsole.log(JSON.stringify(choiceOptions(["Automatic", "2", "odd"], "2", fanModeLabel)));'
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [["Automatic", "Automatisch"], ["2", "Stufe 2"], ["odd", "odd"]])
+
+    def test_entity_choices_show_the_friendly_name_and_the_id(self):
+        pairs = [{"id": "climate.a", "name": "Klima A"}, {"id": "climate.b", "name": None}, {"id": "climate.c"}]
+        self.assertEqual(run_js("entityLabels", [pairs]),
+                         {"climate.a": "Klima A (climate.a)"})
 
     def test_fan_channel_labels_use_the_fan_names(self):
         self.assertEqual(run_js("fanChannelLabel", [1, ["Pumpe", "140mm Radiator"]]), "2: 140mm Radiator")
@@ -253,7 +288,8 @@ class ClimateChoicesTest(unittest.TestCase):
         self.assertTrue(any("unbestätigt" in l for l in lines), lines)
 
     def fields(self):
-        script = js_chunks("HVAC_LABELS", "CLIMATE_FIELDS") + "\nconsole.log(JSON.stringify(CLIMATE_FIELDS));"
+        script = js_chunks("HVAC_LABELS", "PRESET_LABELS", "HORIZONTAL_LABELS", "VERTICAL_LABELS", "fanModeLabel",
+                           "CLIMATE_FIELDS") + "\nconsole.log(JSON.stringify(CLIMATE_FIELDS));"
         out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(out.returncode, 0, out.stderr)
         return [f for f in json.loads(out.stdout) if f.get("path") or f.get("kind") == "token"]

@@ -443,7 +443,8 @@ class App:
         fallback = {"hvac_modes": list(HVAC_MODES), "preset_modes": list(PRESETS), "fan_modes": list(FAN_MODES),
                     "horizontal": list(HORIZONTAL), "vertical": list(VERTICAL)}
         out: dict = {"source": "fallback", "error": None, **{k: list(v) for k, v in fallback.items()},
-                     "climate_entities": [], "select_entities": [], "fallback": fallback}
+                     "climate_entities": [], "select_entities": [], "climate_entity_names": [],
+                     "select_entity_names": [], "fallback": fallback}
         client = self.ha_client_factory() if self.ha_client_factory else None
         if client is None:
             out["error"] = "Home Assistant ist nicht eingerichtet: URL und Token speichern, dann Auswahl neu laden"
@@ -458,6 +459,17 @@ class App:
         out["climate_entities"] = sorted(e for e in by_id if e.startswith("climate."))
         selects = sorted(e for e in by_id if e.startswith("select."))
         out["select_entities"] = [e for e in selects if "swing" in e] or selects
+
+        def named(ids: list[str]) -> list[dict]:  # {id, name}: the same entities with Home Assistant's friendly_name
+            result = []
+            for eid in ids:
+                attrs = by_id[eid].get("attributes")
+                name = attrs.get("friendly_name") if isinstance(attrs, dict) else None
+                result.append({"id": eid, "name": name if isinstance(name, str) and name.strip() else None})
+            return result
+
+        out["climate_entity_names"] = named(out["climate_entities"])
+        out["select_entity_names"] = named(out["select_entities"])
 
         def listed(entity_id: str, attribute: str) -> list[str]:
             attrs = by_id.get(entity_id, {}).get("attributes")
