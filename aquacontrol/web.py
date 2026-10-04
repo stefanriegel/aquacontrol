@@ -88,12 +88,21 @@ class App:
         self._auth_lock = threading.Lock()
         self._verify_slots = threading.BoundedSemaphore(MAX_VERIFY_CONCURRENCY)
         self._failures: deque[float] = deque()  # monotonic times of failed Basic logins
+        self._push_failures: deque[float] = deque()  # same for push tokens (separate: must not lock the UI)
 
-    def _throttled(self, now: float) -> bool:
+    def _throttled(self, now: float, failures: deque[float] | None = None) -> bool:
+        failures = self._failures if failures is None else failures
         with self._auth_lock:
-            while self._failures and now - self._failures[0] > FAIL_WINDOW_S:
-                self._failures.popleft()
-            return len(self._failures) >= FAIL_LIMIT
+            while failures and now - failures[0] > FAIL_WINDOW_S:
+                failures.popleft()
+            return len(failures) >= FAIL_LIMIT
+
+    def push_throttled(self) -> bool:
+        return self._throttled(time.monotonic(), self._push_failures)
+
+    def note_push_failure(self) -> None:
+        with self._auth_lock:
+            self._push_failures.append(time.monotonic())
 
     # --- auth ---------------------------------------------------------------
     def check_basic(self, header: str | None) -> bool:
@@ -306,8 +315,14 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             try:
                 if method == "POST" and path == "/api/external":
+                    if app.push_throttled():
+                        log.debug("push from %s rejected: too many failures", self.client_address[0])
+                        return self._send(429, {"ok": False, "error": "Zu viele Fehlversuche, bitte später erneut versuchen"},
+                                          extra={"Retry-After": str(int(FAIL_WINDOW_S))})
                     source = app.push_source(self.headers.get("Authorization"))
                     if source is None:
+                        app.note_push_failure()
+                        log.warning("failed push-token auth from %s", self.client_address[0])
                         return self._error(401, "ungültiges Token")
                     return self._send(200, app.push(source, self._body()))
                 auth = self.headers.get("Authorization")

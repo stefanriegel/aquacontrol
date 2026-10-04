@@ -320,6 +320,38 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.req("GET", "/api/status")[0], 200)
             self.assertEqual(verify.call_count, 11)
 
+    def test_failed_push_token_is_logged_with_ip_only(self):
+        body = {"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "GPU 0", "value": 45, "unit": "°C"}]}
+        with self.assertLogs("aquacontrol.web", "WARNING") as cm:
+            status, _ = self.req("POST", "/api/external", body, auth=False,
+                                 headers={"Authorization": "Bearer geheimes-token"})
+        self.assertEqual(status, 401)
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("127.0.0.1", cm.output[0])
+        self.assertNotIn("geheimes-token", cm.output[0])
+
+    def test_failed_push_token_throttle_returns_429_without_hashing(self):
+        body = {"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "GPU 0", "value": 45, "unit": "°C"}]}
+        real = web.token_source
+        with mock.patch.object(web, "token_source", side_effect=real) as check:
+            for i in range(10):
+                status, _ = self.req("POST", "/api/external", body, auth=False,
+                                     headers={"Authorization": f"Bearer wrong{i}"})
+                self.assertEqual(status, 401)
+            self.assertEqual(check.call_count, 10)
+            status, resp = self.req("POST", "/api/external", body, auth=False,
+                                    headers={"Authorization": "Bearer tok"})  # even the right token waits
+            self.assertEqual(status, 429, resp)
+            self.assertIn("error", resp)
+            self.assertEqual(check.call_count, 10)
+        # push failures do not lock the UI login
+        self.assertEqual(self.req("GET", "/api/status")[0], 200)
+        self.assertEqual(self.req("GET", "/api/status", auth=False,
+                                  headers={"Authorization": self.auth})[0], 200)
+        self.app._push_failures.clear()
+        status, _ = self.req("POST", "/api/external", body, auth=False, headers={"Authorization": "Bearer tok"})
+        self.assertEqual(status, 200)
+
     def test_failed_login_throttle_expires(self):
         with mock.patch.object(web, "FAIL_DELAY_S", 0):
             for i in range(10):
