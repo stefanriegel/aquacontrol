@@ -287,11 +287,20 @@ class App:
             raise NotFound()
         patch = dict(body)
         token = Secrets.clean_token(patch.pop("token")) if "token" in patch else None  # validate before any write
+        old_url = self.config.climate_config().ha_url
         if patch:
             self.config.patch_climate(patch)
+        notice = None
+        if token is None and self.config.climate_config().ha_url != old_url and self.config.secrets.get_ha_token():
+            # The stored token must never be sent to another address than the one it was entered for.
+            token = ""
+            notice = "Adresse geändert: das gespeicherte Token wurde gelöscht, bitte neu eingeben"
         if token is not None:
             self.config.secrets.set_ha_token(token)  # "" removes it
-        return self.climate_json()
+        out = self.climate_json()
+        if notice:
+            out["notice"] = notice
+        return out
 
     def climate_test(self) -> dict:
         """Read the AC and both louvre selects from Home Assistant. Changes nothing."""

@@ -499,6 +499,46 @@ class WebTest(unittest.TestCase):
         self.assertIs(body["token_set"], False)
         self.assertEqual(self.config.secrets.get_ha_token(), "")
 
+    def test_changing_the_url_without_a_new_token_deletes_the_stored_token(self):
+        self.configure_ha()
+        status, body = self.req("PUT", "/api/climate", {"ha_url": "http://elsewhere.example:8123"})
+        self.assertEqual(status, 200, body)
+        self.assertIs(body["token_set"], False)
+        self.assertIn("Token", body["notice"])
+        self.assertIn("neu", body["notice"])
+        self.assertEqual(self.config.secrets.get_ha_token(), "")
+        self.assertEqual(body["config"]["ha_url"], "http://elsewhere.example:8123")
+        self.assertNotIn("notice", self.req("GET", "/api/climate")[1])
+
+    def test_unchanged_or_equivalent_url_keeps_the_token(self):
+        self.configure_ha()
+        for body in ({"ha_url": "http://ha.example:8123"}, {"ha_url": "http://ha.example:8123/"}, {"enabled": True},
+                     {"ha_url": "http://ha.example:8123", "on": {"minutes": 6}}):
+            with self.subTest(body=body):
+                status, resp = self.req("PUT", "/api/climate", body)
+                self.assertEqual(status, 200, resp)
+                self.assertIs(resp["token_set"], True)
+                self.assertNotIn("notice", resp)
+        self.assertEqual(self.config.secrets.get_ha_token(), self.TOKEN)
+
+    def test_changing_the_url_together_with_a_new_token_keeps_the_new_token(self):
+        self.configure_ha()
+        status, resp = self.req("PUT", "/api/climate", {"ha_url": "http://elsewhere.example:8123", "token": "new.token.value"})
+        self.assertIs(resp["token_set"], True)
+        self.assertNotIn("notice", resp)
+        self.assertEqual(self.config.secrets.get_ha_token(), "new.token.value")
+
+    def test_changing_the_url_without_a_stored_token_has_no_notice(self):
+        status, resp = self.req("PUT", "/api/climate", {"ha_url": "http://ha.example:8123"})
+        self.assertIs(resp["token_set"], False)
+        self.assertNotIn("notice", resp)
+
+    def test_failed_url_change_keeps_the_token(self):
+        self.configure_ha()
+        status, _ = self.req("PUT", "/api/climate", {"ha_url": "ftp://x"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.config.secrets.get_ha_token(), self.TOKEN)
+
     def test_climate_validation_errors_are_400_and_change_nothing(self):
         self.req("PUT", "/api/climate", {"token": self.TOKEN, "ha_url": "http://ha.example:8123"})
         before = self.config.climate_raw()
