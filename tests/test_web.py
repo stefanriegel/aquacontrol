@@ -13,16 +13,19 @@ from unittest import mock
 
 from aquacontrol.auth import hash_password, hash_token
 from aquacontrol.backups import BackupStore
+from aquacontrol.climate import DEFAULT_CLIMATE, ClimateController
 from aquacontrol.config import AppConfig
 from aquacontrol.device import Device
 from aquacontrol.fake import FakeTransport
 from aquacontrol.monitor import Monitor
 from aquacontrol.schedule import Scheduler
 from aquacontrol.sensors import ExternalStore
+from aquacontrol.ha import HAError
 from aquacontrol.validate import make_check
 from aquacontrol import web
 from aquacontrol.web import App, make_server
 from tests.fixtures import load
+from tests.test_climate import E as CLIMATE_ENTITY, FakeClient, H as HSEL, V as VSEL
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
@@ -42,12 +45,21 @@ class WebTest(unittest.TestCase):
         self.monitor.ingest(load("status.bin"))
         self.now = datetime(2026, 10, 5, 12, 0)
         self.scheduler = Scheduler(self.device, self.config.rules, clock=lambda: self.now)
+        self.ha = FakeClient()
+        self.climate = ClimateController(self.monitor.snapshot, self.ha_client, self.config.climate_config)
         self.app = App(self.device, self.monitor, self.scheduler, self.backups, self.config, ExternalStore(),
-                       hash_password("pw", iterations=1000), {"llm-vm": hash_token("tok")}, STATIC)
+                       hash_password("pw", iterations=1000), {"llm-vm": hash_token("tok")}, STATIC,
+                       climate=self.climate, ha_client_factory=self.ha_client)
         self.server = make_server(self.app, "127.0.0.1", 0)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
         self.auth = "Basic " + base64.b64encode(b"admin:pw").decode()
+
+    def ha_client(self):
+        """Like the real factory: a client only if URL and token are configured."""
+        if self.config.climate_config().ha_url and self.config.secrets.get_ha_token():
+            return self.ha
+        return None
 
     def tearDown(self):
         self.server.shutdown()
@@ -419,6 +431,150 @@ class WebTest(unittest.TestCase):
                 pass
             self.assertLess(time.monotonic(), deadline, "slot never released")
             time.sleep(0.05)
+
+    # --- climate API --------------------------------------------------------------------------------
+    TOKEN = "eyJ.hunter2-very-secret.sig"
+
+    def configure_ha(self):
+        status, _ = self.req("PUT", "/api/climate", {"ha_url": "http://ha.example:8123", "token": self.TOKEN})
+        self.assertEqual(status, 200)
+
+    def test_climate_requires_auth(self):
+        for method, path in (("GET", "/api/climate"), ("PUT", "/api/climate"), ("POST", "/api/climate/test")):
+            with self.subTest(path=path, method=method):
+                status, _ = self.req(method, path, {} if method != "GET" else None, auth=False)
+                self.assertEqual(status, 401)
+
+    def test_climate_defaults(self):
+        status, body = self.req("GET", "/api/climate")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["config"], DEFAULT_CLIMATE)
+        self.assertIs(body["token_set"], False)
+        self.assertEqual(body["status"]["state"], "disabled")
+        self.assertEqual(body["status"]["events"], [])
+        self.assertFalse(body["config"]["enabled"])
+
+    def test_climate_partial_update_is_merged_and_persisted(self):
+        status, body = self.req("PUT", "/api/climate", {"enabled": True, "ha_url": "http://ha.example:8123/",
+                                                        "on": {"minutes": 7}, "ac": {"temperature": 22.5}})
+        self.assertEqual(status, 200, body)
+        cfg = body["config"]
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["ha_url"], "http://ha.example:8123")
+        self.assertEqual(cfg["on"], {**DEFAULT_CLIMATE["on"], "minutes": 7})
+        self.assertEqual(cfg["ac"]["preset"], "Quiet")  # untouched value survives
+        self.assertEqual(cfg["ac"]["temperature"], 22.5)
+        disk = json.loads(Path(self.tmp.name, "config.json").read_text())
+        self.assertEqual(disk["climate"], cfg)
+        status, again = self.req("GET", "/api/climate")
+        self.assertEqual(again["config"], cfg)
+        self.assertEqual(AppConfig(Path(self.tmp.name, "config.json")).climate_raw(), cfg)
+
+    def test_token_is_stored_in_secrets_and_never_returned(self):
+        status, body = self.req("PUT", "/api/climate", {"token": self.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertIs(body["token_set"], True)
+        self.assertEqual(self.config.secrets.get_ha_token(), self.TOKEN)
+        self.assertEqual(Path(self.tmp.name, "secrets.json").stat().st_mode & 0o777, 0o600)
+        self.req("PUT", "/api/climate", {"enabled": False})  # makes config.json exist
+        self.assertNotIn(self.TOKEN, Path(self.tmp.name, "config.json").read_text())
+        for method, path, payload in (("GET", "/api/climate", None), ("PUT", "/api/climate", {"enabled": False}),
+                                      ("PUT", "/api/climate", {"token": self.TOKEN})):
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+            headers = {"Authorization": self.auth, "Content-Type": "application/json"}
+            conn.request(method, path, body=None if payload is None else json.dumps(payload).encode(), headers=headers)
+            raw = conn.getresponse().read().decode()
+            conn.close()
+            with self.subTest(path=path, method=method):
+                self.assertNotIn(self.TOKEN, raw)
+                self.assertNotIn("hunter2", raw)
+                self.assertIn('"token_set": true', raw)
+
+    def test_empty_token_clears_and_missing_token_keeps(self):
+        self.req("PUT", "/api/climate", {"token": self.TOKEN})
+        status, body = self.req("PUT", "/api/climate", {"enabled": False})
+        self.assertIs(body["token_set"], True)
+        self.assertEqual(self.config.secrets.get_ha_token(), self.TOKEN)
+        status, body = self.req("PUT", "/api/climate", {"token": ""})
+        self.assertIs(body["token_set"], False)
+        self.assertEqual(self.config.secrets.get_ha_token(), "")
+
+    def test_climate_validation_errors_are_400_and_change_nothing(self):
+        self.req("PUT", "/api/climate", {"token": self.TOKEN, "ha_url": "http://ha.example:8123"})
+        before = self.config.climate_raw()
+        cases = [
+            {"on": {"minutes": 0}}, {"off": {"water_c": 40.0}}, {"ac": {"hvac_mode": "heat"}},
+            {"ac": {"temperature": 20.3}}, {"ha_url": "ftp://x"}, {"entity_id": "switch.x"},
+            {"enabled": "ja"}, {"bogus": 1}, {"on": "x"}, {"on": {"fan_channels": [5]}},
+            {"max_switches_per_hour": 0},
+            {"token": 5}, {"token": "has space"}, {"token": None},
+            {"on": {"minutes": 0}, "token": "valid.token.value"},  # bad config: token must not be stored either
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.req("PUT", "/api/climate", body)
+                self.assertEqual(status, 400, resp)
+                self.assertIn("error", resp)
+                self.assertNotIn(self.TOKEN, json.dumps(resp))
+        self.assertEqual(self.config.climate_raw(), before)
+        self.assertEqual(self.config.secrets.get_ha_token(), self.TOKEN)
+        status, _ = self.req("PUT", "/api/climate", raw=b"{nope")
+        self.assertEqual(status, 400)
+        status, _ = self.req("PUT", "/api/climate", [1])
+        self.assertEqual(status, 400)
+
+    def test_climate_error_messages_are_german(self):
+        status, resp = self.req("PUT", "/api/climate", {"on": {"minutes": 0}})
+        self.assertIn("Minuten", resp["error"])
+
+    def test_climate_test_needs_setup(self):
+        status, resp = self.req("POST", "/api/climate/test", {})
+        self.assertEqual(status, 400)
+        self.assertIn("eingerichtet", resp["error"])
+        self.assertEqual(self.ha.log, [])
+
+    def test_climate_test_reads_and_switches_nothing(self):
+        self.configure_ha()
+        self.ha.states[CLIMATE_ENTITY] = {"state": "cool", "attributes": {
+            "temperature": 20.5, "preset_mode": "Quiet", "fan_mode": "Automatic"}}
+        self.ha.states[HSEL]["state"] = "left"
+        self.ha.states[VSEL]["state"] = "down_center"
+        status, resp = self.req("POST", "/api/climate/test", {})
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp, {"ok": True, "state": "cool", "temperature": 20.5, "preset": "Quiet",
+                                "fan_mode": "Automatic", "horizontal": "left", "vertical": "down_center"})
+        self.assertEqual(self.ha.calls, [])
+        self.assertEqual(sorted(self.ha.gets), sorted([CLIMATE_ENTITY, HSEL, VSEL]))
+        self.assertNotIn(self.TOKEN, json.dumps(resp))
+
+    def test_climate_test_ha_error_is_502_without_token(self):
+        self.configure_ha()
+        self.ha.failing = {"get"}
+        status, resp = self.req("POST", "/api/climate/test", {})
+        self.assertEqual(status, 502)
+        self.assertIn("Home Assistant", resp["error"])
+        self.assertNotIn(self.TOKEN, json.dumps(resp))
+        self.assertEqual(self.ha.calls, [])
+
+    def test_climate_test_names_the_failing_entity(self):
+        self.configure_ha()
+        orig = self.ha.get_state
+
+        def get_state(entity_id):
+            if entity_id == VSEL:
+                raise HAError("Home Assistant: nicht gefunden")
+            return orig(entity_id)
+        self.ha.get_state = get_state
+        status, resp = self.req("POST", "/api/climate/test", {})
+        self.assertEqual(status, 502)
+        self.assertIn(VSEL, resp["error"])
+
+    def test_climate_status_reflects_the_controller(self):
+        self.req("PUT", "/api/climate", {"enabled": True})
+        self.climate.tick()
+        status, body = self.req("GET", "/api/climate")
+        self.assertEqual(body["status"]["state"], "idle")  # water is 31.7 C: nothing to do
+        self.assertTrue(body["status"]["enabled"])
 
 
 if __name__ == "__main__":

@@ -118,13 +118,20 @@ class Secrets:
             token = self._load().get("ha_token", "")
         return token if isinstance(token, str) else ""
 
-    def set_ha_token(self, token: str) -> None:
-        """Store the token; an empty string removes it."""
+    @staticmethod
+    def clean_token(token: object) -> str:
+        """Strip surrounding whitespace and check the token (printable ASCII, no spaces: it ends up in an HTTP
+        header). The empty string is valid and means "delete"."""
         if not isinstance(token, str):
             raise ClimateConfigError("Token muss ein Text sein")
         token = token.strip()
         if token and not re.fullmatch(r"[\x21-\x7e]{1,4096}", token):
             raise ClimateConfigError("Token enthält ungültige Zeichen oder ist zu lang")
+        return token
+
+    def set_ha_token(self, token: str) -> None:
+        """Store the token; an empty string removes it."""
+        token = self.clean_token(token)
         with self._lock:
             data = self._load()
             if token:

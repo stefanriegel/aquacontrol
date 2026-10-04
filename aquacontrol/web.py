@@ -16,12 +16,15 @@ from collections import deque
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
 from . import protocol as p
 from .auth import token_source, verify_password
 from .backups import BackupError, BackupStore
-from .config import AppConfig
+from .climate import ClimateConfigError, ClimateController
+from .config import AppConfig, Secrets
 from .device import Device, DeviceError
+from .ha import HAError
 from .monitor import Monitor
 from .schedule import ScheduleError, Scheduler, rules_to_json
 from .sensors import ExternalError, ExternalStore
@@ -45,6 +48,10 @@ MODES_BY_NAME = {"fixed": p.MODE_FIXED, "target": p.MODE_TARGET, "curve": p.MODE
 
 class BadRequest(ValueError):
     pass
+
+
+class NotFound(Exception):
+    """Feature not wired up in this App (-> 404)."""
 
 
 class LoginThrottled(Exception):
@@ -73,7 +80,9 @@ def _number(body: dict, key: str) -> float | None:
 class App:
     def __init__(self, device: Device, monitor: Monitor, scheduler: Scheduler, backups: BackupStore,
                  config: AppConfig, externals: ExternalStore, password_hash: str,
-                 push_tokens: dict[str, str], static_dir: str | Path):
+                 push_tokens: dict[str, str], static_dir: str | Path,
+                 climate: ClimateController | None = None,
+                 ha_client_factory: Callable[[], object | None] | None = None):
         self.device = device
         self.monitor = monitor
         self.scheduler = scheduler
@@ -83,6 +92,8 @@ class App:
         self.password_hash = password_hash
         self.push_tokens = push_tokens
         self.static_dir = Path(static_dir)
+        self.climate = climate
+        self.ha_client_factory = ha_client_factory
         self._names: p.Names | None = None
         self._auth_cache: dict[str, float] = {}
         self._auth_lock = threading.Lock()
@@ -265,6 +276,45 @@ class App:
         self.scheduler.tick()
         return self.schedule_json()
 
+    def climate_json(self) -> dict:
+        if self.climate is None:
+            raise NotFound()
+        return {"config": self.config.climate_raw(), "token_set": bool(self.config.secrets.get_ha_token()),
+                "status": self.climate.status()}
+
+    def put_climate(self, body: dict) -> dict:
+        if self.climate is None:
+            raise NotFound()
+        patch = dict(body)
+        token = Secrets.clean_token(patch.pop("token")) if "token" in patch else None  # validate before any write
+        if patch:
+            self.config.patch_climate(patch)
+        if token is not None:
+            self.config.secrets.set_ha_token(token)  # "" removes it
+        return self.climate_json()
+
+    def climate_test(self) -> dict:
+        """Read the AC and both louvre selects from Home Assistant. Changes nothing."""
+        if self.climate is None:
+            raise NotFound()
+        client = self.ha_client_factory() if self.ha_client_factory else None
+        if client is None:
+            raise BadRequest("Home Assistant ist nicht eingerichtet: URL und Token speichern, dann testen")
+        cfg = self.config.climate_config()
+
+        def read(entity_id: str) -> dict:
+            try:
+                return client.get_state(entity_id)
+            except HAError as e:
+                raise HAError(f"{entity_id}: {e}") from None
+
+        ac = read(cfg.entity_id)
+        attrs = ac.get("attributes") if isinstance(ac.get("attributes"), dict) else {}
+        return {"ok": True, "state": ac.get("state"), "temperature": attrs.get("temperature"),
+                "preset": attrs.get("preset_mode"), "fan_mode": attrs.get("fan_mode"),
+                "horizontal": read(cfg.horizontal_select).get("state"),
+                "vertical": read(cfg.vertical_select).get("state")}
+
     def backups_json(self) -> list[dict]:
         return [asdict(b) for b in self.backups.list()]
 
@@ -350,8 +400,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 self._route(method, path)
             except BadRequest as e:
                 self._error(400, str(e))
-            except (ValidationError, ScheduleError, ExternalError, BackupError) as e:
+            except (ValidationError, ScheduleError, ExternalError, BackupError, ClimateConfigError) as e:
                 self._error(400, str(e))
+            except NotFound:
+                self._error(404, "nicht gefunden")
+            except HAError as e:
+                self._error(502, str(e))
             except DeviceError as e:
                 self._error(502, str(e))
             except Exception:
@@ -378,6 +432,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 return self._send(200, app.settings_json())
             if method == "GET" and path == "/api/schedule":
                 return self._send(200, app.schedule_json())
+            if method == "GET" and path == "/api/climate":
+                return self._send(200, app.climate_json())
             if method == "GET" and path == "/api/backups":
                 return self._send(200, app.backups_json())
             if method in ("PUT", "POST"):
@@ -393,6 +449,10 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, app.put_schedule(body))
                 if method == "POST" and path == "/api/schedule/override":
                     return self._send(200, app.override(body))
+                if method == "PUT" and path == "/api/climate":
+                    return self._send(200, app.put_climate(body))
+                if method == "POST" and path == "/api/climate/test":
+                    return self._send(200, app.climate_test())
                 m = re.fullmatch(r"/api/backups/([A-Za-z0-9_.-]+\.bin)/restore", path)
                 if method == "POST" and m:
                     return self._send(200, app.restore(m.group(1)))
