@@ -508,7 +508,7 @@ class WebTest(unittest.TestCase):
         body = {"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "GPU 0", "value": 45, "unit": "°C"}]}
         real = web.token_source
         with mock.patch.object(web, "token_source", side_effect=real) as check:
-            for i in range(10):
+            for i in range(web.FAIL_LIMIT):
                 status, _ = self.req("POST", "/api/external", body, auth=False,
                                      headers={"Authorization": f"Bearer wrong{i}"})
                 self.assertEqual(status, 401)
@@ -525,6 +525,29 @@ class WebTest(unittest.TestCase):
         self.app._push_failures.clear()
         status, _ = self.req("POST", "/api/external", body, auth=False, headers={"Authorization": "Bearer tok"})
         self.assertEqual(status, 200)
+
+    def test_push_token_throttle_is_per_client_ip(self):
+        for _ in range(web.FAIL_LIMIT):
+            self.app.note_push_failure("192.0.2.7")
+        self.assertTrue(self.app.push_throttled("192.0.2.7"))
+        self.assertFalse(self.app.push_throttled("192.0.2.8"))  # a second client is not locked out
+        self.assertFalse(self.app.push_throttled("127.0.0.1"))
+        # the throttled client's pushes get 429, the test client (127.0.0.1) still reaches token checking
+        body = {"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "GPU 0", "value": 45, "unit": "°C"}]}
+        status, _ = self.req("POST", "/api/external", body, auth=False, headers={"Authorization": "Bearer tok"})
+        self.assertEqual(status, 200)
+        # failures age out per client, and idle clients do not pile up in memory
+        with mock.patch.object(web.time, "monotonic", return_value=time.monotonic() + web.FAIL_WINDOW_S + 1):
+            self.assertFalse(self.app.push_throttled("192.0.2.7"))
+            self.app.note_push_failure("192.0.2.9")
+        self.assertEqual(list(self.app._push_failures), ["192.0.2.9"])
+
+    def test_push_failure_table_is_bounded(self):
+        for n in range(web.MAX_TRACKED_IPS + 50):
+            self.app.note_push_failure(f"10.0.{n // 256}.{n % 256}")
+        self.assertLessEqual(len(self.app._push_failures), web.MAX_TRACKED_IPS)
+        self.assertIn(f"10.0.{(web.MAX_TRACKED_IPS + 49) // 256}.{(web.MAX_TRACKED_IPS + 49) % 256}",
+                      self.app._push_failures)
 
     def test_failed_login_throttle_expires(self):
         with mock.patch.object(web, "FAIL_DELAY_S", 0):

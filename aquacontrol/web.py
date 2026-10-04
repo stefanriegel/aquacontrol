@@ -44,6 +44,7 @@ MAX_VERIFY_CONCURRENCY = 2  # parallel PBKDF2 verifications
 VERIFY_WAIT_S = 2.0         # how long a login waits for a verification slot before 503
 FAIL_LIMIT = 10             # failed logins per FAIL_WINDOW_S before further attempts get 429
 FAIL_WINDOW_S = 60.0
+MAX_TRACKED_IPS = 256       # clients remembered for the per-IP push-token throttle
 MAX_CONNECTIONS = 32
 MODES_BY_NAME = {"fixed": p.MODE_FIXED, "target": p.MODE_TARGET, "curve": p.MODE_CURVE}
 LED_MODE_NAMES = {p.LED_MODE_UNUSED: "unbenutzt", p.LED_MODE_STATIC: "statisch", p.LED_MODE_COLOR_SWITCH: "farbschalter"}
@@ -149,21 +150,40 @@ class App:
         self._auth_lock = threading.Lock()
         self._verify_slots = threading.BoundedSemaphore(MAX_VERIFY_CONCURRENCY)
         self._failures: deque[float] = deque()  # monotonic times of failed Basic logins
-        self._push_failures: deque[float] = deque()  # same for push tokens (separate: must not lock the UI)
+        # failed push tokens per client IP (separate from the login throttle: must not lock the UI, and one
+        # noisy client must not lock out the others)
+        self._push_failures: dict[str, deque[float]] = {}
 
-    def _throttled(self, now: float, failures: deque[float] | None = None) -> bool:
-        failures = self._failures if failures is None else failures
+    def _throttled(self, now: float) -> bool:
         with self._auth_lock:
+            while self._failures and now - self._failures[0] > FAIL_WINDOW_S:
+                self._failures.popleft()
+            return len(self._failures) >= FAIL_LIMIT
+
+    def _prune_push_failures(self, now: float) -> None:  # caller holds _auth_lock
+        for ip in [ip for ip, f in self._push_failures.items() if not f or now - f[-1] > FAIL_WINDOW_S]:
+            del self._push_failures[ip]
+
+    def push_throttled(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._auth_lock:
+            failures = self._push_failures.get(ip)
+            if failures is None:
+                return False
             while failures and now - failures[0] > FAIL_WINDOW_S:
                 failures.popleft()
+            if not failures:
+                del self._push_failures[ip]
             return len(failures) >= FAIL_LIMIT
 
-    def push_throttled(self) -> bool:
-        return self._throttled(time.monotonic(), self._push_failures)
-
-    def note_push_failure(self) -> None:
+    def note_push_failure(self, ip: str) -> None:
+        now = time.monotonic()
         with self._auth_lock:
-            self._push_failures.append(time.monotonic())
+            if ip not in self._push_failures:
+                self._prune_push_failures(now)
+                while len(self._push_failures) >= MAX_TRACKED_IPS:  # still full: forget the oldest client
+                    del self._push_failures[next(iter(self._push_failures))]
+            self._push_failures.setdefault(ip, deque()).append(now)
 
     # --- auth ---------------------------------------------------------------
     def check_basic(self, header: str | None) -> bool:
@@ -544,13 +564,13 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             try:
                 if method == "POST" and path == "/api/external":
-                    if app.push_throttled():
+                    if app.push_throttled(self.client_address[0]):
                         log.debug("push from %s rejected: too many failures", self.client_address[0])
                         return self._send(429, {"ok": False, "error": "Zu viele Fehlversuche, bitte später erneut versuchen"},
                                           extra={"Retry-After": str(int(FAIL_WINDOW_S))})
                     source = app.push_source(self.headers.get("Authorization"))
                     if source is None:
-                        app.note_push_failure()
+                        app.note_push_failure(self.client_address[0])
                         log.warning("failed push-token auth from %s", self.client_address[0])
                         return self._error(401, "ungültiges Token")
                     return self._send(200, app.push(source, self._body()))
