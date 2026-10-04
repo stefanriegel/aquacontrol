@@ -102,6 +102,7 @@ class Secrets:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = threading.Lock()
+        self._warned = False
 
     def _load(self) -> dict:
         try:
@@ -114,18 +115,35 @@ class Secrets:
         return raw if isinstance(raw, dict) else {}
 
     def get_ha_token(self) -> str:
+        """The stored token, or "" if there is none or it fails the validation of clean_token (a hand-edited file
+        must not get odd characters into an HTTP header). Warns once, never with the value."""
         with self._lock:
             token = self._load().get("ha_token", "")
-        return token if isinstance(token, str) else ""
+            if token == "":
+                return ""
+            if isinstance(token, str) and self._token_ok(token):
+                self._warned = False
+                return token
+            if not self._warned:
+                self._warned = True
+                log.warning("%s: ha_token is not a valid token (printable ASCII without spaces), ignoring it",
+                            self.path)
+            return ""
 
-    @staticmethod
-    def clean_token(token: object) -> str:
+    _TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")
+
+    @classmethod
+    def _token_ok(cls, token: str) -> bool:
+        return cls._TOKEN.fullmatch(token) is not None
+
+    @classmethod
+    def clean_token(cls, token: object) -> str:
         """Strip surrounding whitespace and check the token (printable ASCII, no spaces: it ends up in an HTTP
         header). The empty string is valid and means "delete"."""
         if not isinstance(token, str):
             raise ClimateConfigError("Token muss ein Text sein")
         token = token.strip()
-        if token and not re.fullmatch(r"[\x21-\x7e]{1,4096}", token):
+        if token and not cls._token_ok(token):
             raise ClimateConfigError("Token enthält ungültige Zeichen oder ist zu lang")
         return token
 

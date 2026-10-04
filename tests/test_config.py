@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -168,6 +169,23 @@ class SecretsTest(unittest.TestCase):
         self.assertEqual(sec.get_ha_token(), "")
         sec.set_ha_token(self.TOKEN)
         self.assertEqual(sec.get_ha_token(), self.TOKEN)
+
+    def test_stored_token_that_fails_validation_is_not_returned(self):
+        # a hand-edited secrets.json must not be able to smuggle header-breaking characters into a request
+        for bad in ("SECRET\nTOKEN", "SECRET\r\nX-Evil: 1", "SECRET has space", "SECRETtökən", "S" * 5000, 5, ["x"]):
+            with self.subTest(bad=repr(bad)[:16]):
+                self.path.write_text(json.dumps({"ha_token": bad}))
+                sec = Secrets(self.path)
+                with self.assertLogs("aquacontrol.config", level="WARNING") as logs:
+                    self.assertEqual(sec.get_ha_token(), "")
+                self.assertNotIn("SECRET", "\n".join(logs.output))
+                with self.assertNoLogs("aquacontrol.config", level="WARNING"):  # warned once, not every cycle
+                    self.assertEqual(sec.get_ha_token(), "")
+
+    def test_stored_token_with_surrounding_whitespace_is_not_usable_either(self):
+        self.path.write_text(json.dumps({"ha_token": f" {self.TOKEN}\n"}))
+        with self.assertLogs("aquacontrol.config", level="WARNING"):
+            self.assertEqual(Secrets(self.path).get_ha_token(), "")
 
     def test_token_is_never_logged(self):
         with self.assertNoLogs(level="DEBUG"):

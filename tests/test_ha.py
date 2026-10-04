@@ -1,7 +1,9 @@
+import http.client
 import json
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from aquacontrol.ha import HAClient, HAError
@@ -17,6 +19,7 @@ class FakeHA:
         self.reply = (200, b'{"state": "off"}')
         self.delay = 0.0
         self.location = None
+        self.truncate = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -34,9 +37,11 @@ class FakeHA:
                 self.send_response(code)
                 if outer.location:
                     self.send_header("Location", outer.location)
-                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Length", str(len(payload) + (50 if outer.truncate else 0)))
                 self.end_headers()
                 self.wfile.write(payload)
+                if outer.truncate:
+                    self.close_connection = True
 
             do_GET = do_POST = _handle
 
@@ -131,6 +136,31 @@ class HAClientTest(unittest.TestCase):
         with self.assertRaises(HAError):
             self.client.get_state("climate.x")
         self.assertEqual(other.requests, [])
+
+    def test_header_breaking_token_gives_a_fixed_message_without_the_token(self):
+        for token in ("SECRET\nTOKEN", "SECRET\r\nX-Evil: 1", "SECRETtökən"):
+            with self.subTest(token=token):
+                with self.assertRaises(HAError) as cm:
+                    HAClient(self.ha.url, token).get_state("climate.x")
+                self.assertNotIn("SECRET", str(cm.exception))
+                self.assertNotIn("Bearer", str(cm.exception))
+                self.assertIn("Home Assistant", str(cm.exception))
+        self.assertEqual(self.ha.requests, [])
+
+    def test_truncated_response_is_an_ha_error(self):
+        self.ha.truncate = True  # http.client.IncompleteRead is not an OSError
+        with self.assertRaises(HAError) as cm:
+            self.client.get_state("climate.x")
+        self.assertIn("Home Assistant", str(cm.exception))
+        self.assertNotIn(TOKEN, str(cm.exception))
+
+    def test_other_http_protocol_errors_are_ha_errors(self):
+        for exc in (http.client.BadStatusLine("garbage"), http.client.LineTooLong("status line"),
+                    http.client.RemoteDisconnected("closed")):
+            with self.subTest(exc=type(exc).__name__), mock.patch("aquacontrol.ha._OPENER.open", side_effect=exc):
+                with self.assertRaises(HAError) as cm:
+                    self.client.call("climate", "turn_off", {})
+                self.assertNotIn(TOKEN, str(cm.exception))
 
     def test_invalid_url_scheme(self):
         with self.assertRaises(HAError):

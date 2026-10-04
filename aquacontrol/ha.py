@@ -1,6 +1,7 @@
 """Tiny Home Assistant REST client (urllib only). Error messages are German and never contain the token."""
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import urllib.error
@@ -58,7 +59,11 @@ class HAClient:
             if isinstance(e.reason, (TimeoutError, socket.timeout)):
                 raise HAError("Home Assistant: keine Antwort innerhalb der Zeit") from None
             raise HAError(f"Home Assistant nicht erreichbar: {e.reason}") from None
-        except (OSError, ValueError) as e:  # connection reset, malformed URL, ...
+        except http.client.HTTPException:  # IncompleteRead, BadStatusLine, ...: not OSErrors
+            raise HAError("Home Assistant: ungültige oder abgebrochene Antwort") from None
+        except ValueError:  # e.g. a header value with a newline: the message would contain the token
+            raise HAError("Home Assistant: ungültige Anfrage (URL oder Token fehlerhaft)") from None
+        except OSError as e:  # connection reset, ...
             raise HAError(f"Home Assistant nicht erreichbar: {e}") from None
 
     def get_state(self, entity_id: str) -> dict:
