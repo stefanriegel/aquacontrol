@@ -27,6 +27,7 @@ DEFAULT_CLIMATE: dict = {
     "min_on_minutes": 30,
     "min_off_minutes": 15,
     "max_switches_per_hour": 2,
+    "manual_off_pause_minutes": 120,
     "ac": {"hvac_mode": "cool", "temperature": 20.0, "preset": "Quiet", "fan_mode": "Automatic",
            "horizontal": "left", "vertical": "down_center"},
 }
@@ -38,6 +39,7 @@ HORIZONTAL = ("auto", "left", "left_center", "center", "right_center", "right")
 VERTICAL = ("swing", "auto", "up", "up_center", "center", "down_center", "down")
 MIN_GAP_C = 2.0
 MAX_SWITCHES_LIMIT = 20
+MANUAL_OFF_PAUSE_RANGE = (10, 480)
 
 
 class ClimateConfigError(ValueError):
@@ -80,6 +82,7 @@ class ClimateConfig:
     min_on_minutes: int
     min_off_minutes: int
     max_switches_per_hour: int
+    manual_off_pause_minutes: int
     ac: ACConfig
 
     def to_json(self) -> dict:
@@ -91,6 +94,7 @@ class ClimateConfig:
             "off": {"water_c": self.off.water_c, "minutes": self.off.minutes},
             "min_on_minutes": self.min_on_minutes, "min_off_minutes": self.min_off_minutes,
             "max_switches_per_hour": self.max_switches_per_hour,
+            "manual_off_pause_minutes": self.manual_off_pause_minutes,
             "ac": {"hvac_mode": self.ac.hvac_mode, "temperature": self.ac.temperature,
                    "preset": self.ac.preset, "fan_mode": self.ac.fan_mode,
                    "horizontal": self.ac.horizontal, "vertical": self.ac.vertical},
@@ -168,7 +172,7 @@ def parse_climate_config(raw: object) -> ClimateConfig:
     if not isinstance(raw, dict):
         raise ClimateConfigError("Klima-Konfiguration muss ein Objekt sein")
     top = {"enabled", "ha_url", "entity_id", "horizontal_select", "vertical_select", "on", "off",
-           "min_on_minutes", "min_off_minutes", "max_switches_per_hour", "ac"}
+           "min_on_minutes", "min_off_minutes", "max_switches_per_hour", "manual_off_pause_minutes", "ac"}
     for k in raw:
         if k not in top:
             raise ClimateConfigError(f"Unbekannte Einstellung: {k}")
@@ -209,6 +213,10 @@ def parse_climate_config(raw: object) -> ClimateConfig:
     max_switches = get(raw, "max_switches_per_hour", d)
     if isinstance(max_switches, bool) or not isinstance(max_switches, int) or not 1 <= max_switches <= MAX_SWITCHES_LIMIT:
         raise ClimateConfigError(f"max_switches_per_hour muss eine ganze Zahl von 1 bis {MAX_SWITCHES_LIMIT} sein")
+    pause = get(raw, "manual_off_pause_minutes", d)
+    low, high = MANUAL_OFF_PAUSE_RANGE
+    if isinstance(pause, bool) or not isinstance(pause, int) or not low <= pause <= high:
+        raise ClimateConfigError(f"manual_off_pause_minutes muss eine ganze Zahl von {low} bis {high} sein")
     return ClimateConfig(
         enabled=enabled,
         ha_url=_url(get(raw, "ha_url", d)),
@@ -218,7 +226,7 @@ def parse_climate_config(raw: object) -> ClimateConfig:
         on=on, off=off,
         min_on_minutes=_minutes(get(raw, "min_on_minutes", d), "Mindestlaufzeit"),
         min_off_minutes=_minutes(get(raw, "min_off_minutes", d), "Sperrzeit"),
-        max_switches_per_hour=max_switches, ac=ac)
+        max_switches_per_hour=max_switches, manual_off_pause_minutes=pause, ac=ac)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -271,6 +279,9 @@ class ClimateController:
         self._arming_since: float | None = None
         self._off_since: float | None = None
         self._cooldown_until = 0.0
+        self._last_seen: str | None = None      # HA state at the last look (None: nothing trustworthy)
+        self._manual_off_until: float | None = None  # set: a person switched the AC off, no automatic on until then
+        self._off_pending = False      # our turn_off failed: a later "off" is still our own doing
         self._next_poll = 0.0          # a foreign (manually running) AC is looked at again only from here on
         self._switches: list[float] = []
         self._failures = 0
@@ -322,6 +333,7 @@ class ClimateController:
             "owned_since": self._owned_since,
             "cooldown_until": self._cooldown_until if self._owned_since is None and now < self._cooldown_until else None,
             "off_condition_since": self._off_since,
+            "manual_off_until": self._manual_off_until,
             "retry_at": self._retry_at,
             "last_error": self._last_error,
             "switches_last_hour": self._switch_count(now),
@@ -386,6 +398,8 @@ class ClimateController:
             if self._owned_since is not None:
                 self._event(now, "Automatik deaktiviert, Besitz abgegeben (die Klimaanlage bleibt unverändert)")
             self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
+            self._last_seen = self._manual_off_until = None
+            self._off_pending = False
             self._failures, self._retry_at = 0, None
             self._state, self._reason = "disabled", "Automatik ist deaktiviert"
             return
@@ -402,8 +416,11 @@ class ClimateController:
             if on_met:
                 if self._arming_since is None:
                     self._arming_since = now
-            else:
-                self._arming_since, self._next_poll = None, 0.0
+            else:  # the on-condition is interrupted: old observations are outdated, a manual-off pause is over
+                self._arming_since, self._next_poll, self._last_seen = None, 0.0, None
+                if self._manual_off_until is not None:
+                    self._manual_off_until = None
+                    self._event(now, "Wasser ist wieder kühler: die Pause nach dem Ausschalten von Hand ist beendet")
 
         client = self._client_factory()
         if client is None:
@@ -449,8 +466,13 @@ class ClimateController:
         if st.get("state") in UNAVAILABLE:
             self._reason = "Klimaanlage ist in Home Assistant gerade nicht verfügbar, es wird nichts geschaltet"
             return
+        self._last_seen = st.get("state")
         if self._fingerprint_of(st) != self._fingerprint:
-            self._hand_over(now, cfg, st)
+            if st.get("state") == "off" and self._off_pending:  # our turn_off timed out, but HA did execute it
+                self._finish_off(now, cfg, "Klimaanlage ist aus: das Ausschalten war als Fehler gemeldet worden, "
+                                           "gilt als eigenes Ausschalten")
+            else:
+                self._hand_over(now, cfg, st)
             return
         off_at = None if self._off_since is None else self._off_since + cfg.off.minutes * 60
         run_at = self._owned_since + cfg.min_on_minutes * 60
@@ -464,29 +486,64 @@ class ClimateController:
                             f"{_minutes_left(max(off_at, run_at) - now)} min")
 
     def _hand_over(self, now: float, cfg: ClimateConfig, st: dict) -> None:
-        self._event(now, f"Handbetrieb übernommen: Klimaanlage steht jetzt auf {st.get('state')}, "
-                         "aquacontrol schaltet nichts mehr")
+        state = st.get("state")
         self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
+        self._off_pending = False
+        self._last_seen = state
         self._cooldown_until = now + cfg.min_off_minutes * 60  # never fight a manual change straight away
+        if state == "off":
+            self._manual_off(now, cfg, f"Handbetrieb übernommen: Klimaanlage wurde von Hand ausgeschaltet")
+            return
+        self._event(now, f"Handbetrieb übernommen: Klimaanlage steht jetzt auf {state}, aquacontrol schaltet nichts mehr")
         self._state = "cooldown"
         self._reason = f"Handbetrieb übernommen, Sperrzeit noch {cfg.min_off_minutes} min"
+
+    def _manual_off(self, now: float, cfg: ClimateConfig, what: str) -> None:
+        """A person switched the AC off: do not switch it on again until the on-condition has been interrupted once
+        (see _decide), or at the latest after the configured pause."""
+        self._manual_off_until = now + cfg.manual_off_pause_minutes * 60
+        self._arming_since = None
+        self._event(now, f"{what} – Automatik pausiert bis das Wasser wieder kühl ist "
+                         f"(spätestens {self._clock_text(self._manual_off_until)})")
+        self._manual_off_status()
+
+    def _manual_off_status(self) -> None:
+        self._state = "cooldown"
+        self._reason = ("Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist "
+                        f"(spätestens {self._clock_text(self._manual_off_until)})")
+
+    @staticmethod
+    def _clock_text(epoch: float) -> str:
+        return time.strftime("%H:%M", time.localtime(epoch))
 
     def _turn_off(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
         try:
             client.call("climate", "turn_off", {"entity_id": cfg.entity_id})
         except HAError as e:
+            self._off_pending = True  # HA may have executed it anyway: a later "off" is still ours
             self._fail(now, "Ausschalten", e)
             return
         self._ha_ok = True
+        self._finish_off(now, cfg, f"Klimaanlage ausgeschaltet (Wasser {_fmt_c(water)} ≤ {_fmt_c(cfg.off.water_c)} "
+                                   f"seit {cfg.off.minutes} min)")
+
+    def _finish_off(self, now: float, cfg: ClimateConfig, message: str) -> None:
         self._record_switch(now)  # counts as a switch, but is never blocked by the limit
         self._owned_since = self._fingerprint = self._off_since = None
+        self._off_pending = False
+        self._last_seen = "off"
         self._cooldown_until = now + cfg.min_off_minutes * 60
-        self._event(now, f"Klimaanlage ausgeschaltet (Wasser {_fmt_c(water)} ≤ {_fmt_c(cfg.off.water_c)} "
-                         f"seit {cfg.off.minutes} min)")
+        self._event(now, message)
         self._state = "cooldown"
         self._reason = f"Sperrzeit nach dem Ausschalten: noch {cfg.min_off_minutes} min"
 
     def _tick_unowned(self, now: float, cfg: ClimateConfig, client, water: float | None, why_not: str) -> None:
+        if self._manual_off_until is not None:
+            if now < self._manual_off_until:
+                self._manual_off_status()
+                return
+            self._manual_off_until = None
+            self._event(now, f"Pause nach dem Ausschalten von Hand abgelaufen ({cfg.manual_off_pause_minutes} min)")
         if now < self._cooldown_until:
             self._state = "cooldown"
             self._reason = f"Sperrzeit: Einschalten frühestens in {_minutes_left(self._cooldown_until - now)} min"
@@ -517,6 +574,10 @@ class ClimateController:
         if st is None:
             return
         state = st.get("state")
+        seen, self._last_seen = self._last_seen, state
+        if state == "off" and seen is not None and seen != "off" and seen not in UNAVAILABLE:
+            self._manual_off(now, cfg, "Klimaanlage wurde von Hand ausgeschaltet")  # it was running before
+            return
         if state != "off":
             self._next_poll = now + cfg.on.minutes * 60
             self._state = "idle"

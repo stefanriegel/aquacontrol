@@ -269,14 +269,17 @@ class TurnOnTest(unittest.TestCase):
                 r.advance(10)
                 self.assertEqual(r.client.calls, [])
 
-    def test_switches_on_once_manual_ac_is_off_again(self):
+    def test_switches_on_when_manual_ac_is_off_and_the_condition_was_interrupted_meanwhile(self):
         r = Rig()
         r.client.ac("cool")
         r.tick()
-        r.advance(10)
+        r.advance(5.5)                                   # seen running: hands off
         self.assertEqual(r.client.calls, [])
-        r.client.ac("off")
-        r.advance(5.5)  # a manually running AC is looked at again only every on.minutes
+        r.set(cool())                                    # water cools down, the condition is interrupted
+        r.client.ac("off")                               # and the AC is switched off meanwhile
+        r.advance(1)
+        r.set(hot())
+        r.advance(5.5)                                   # nobody switched it off while the water was hot
         self.assertEqual(r.client.calls, ON_CALLS)
 
     def test_manual_ac_is_not_polled_every_cycle(self):
@@ -400,18 +403,6 @@ class OwnershipTest(unittest.TestCase):
         r.client.ac(temperature=20)  # int instead of float
         r.advance(1)
         self.assertEqual(r.state(), "owned")
-
-    def test_hand_over_blocks_switching_on_for_the_lockout(self):
-        r = Rig(max_switches_per_hour=10)
-        r.bring_on()
-        r.client.ac("off")                      # somebody switched it off by hand while the water is still hot
-        r.advance(0.5)
-        r.client.log.clear()
-        r.advance(14)
-        self.assertEqual(r.client.calls, [])
-        self.assertEqual(r.state(), "cooldown")
-        r.advance(2)
-        self.assertEqual(r.client.calls, ON_CALLS)
 
     def test_ha_unavailable_while_owned_keeps_ownership(self):
         r = Rig()
@@ -614,10 +605,14 @@ class LockoutAndLimitTest(unittest.TestCase):
     def test_hand_over_does_not_count_as_a_switch(self):
         r = Rig(max_switches_per_hour=2, min_off_minutes=1)
         r.bring_on()                               # switch 1
-        r.client.ac("off")
+        r.client.ac("heat")
         r.advance(1.5)                             # hand over
+        r.set(cool())
+        r.client.ac("off")
+        r.advance(2)
         r.client.log.clear()
-        r.advance(5)
+        r.set(hot())
+        r.advance(5.5)
         self.assertEqual(r.client.calls, ON_CALLS)  # switch 2 is still allowed
 
 
@@ -768,6 +763,163 @@ class ErrorTest(unittest.TestCase):
         self.assertEqual(r.client.calls, ON_CALLS)
         self.assertNotEqual(r.state(), "owned")
         self.assertEqual(r.status()["switches_last_hour"], 1)
+
+
+class ManualOffTest(unittest.TestCase):
+    """A person switching the AC off by hand is never countered while the on-condition simply persists."""
+
+    def owned_then_off_by_hand(self, **patch):
+        r = Rig(**patch)
+        r.bring_on()
+        r.client.ac("off")
+        r.advance(1)
+        return r
+
+    def foreign_then_off_by_hand(self, **patch):
+        r = Rig(**patch)
+        r.client.ac("cool")
+        r.tick()
+        r.advance(5.5)                                   # seen running, hands off
+        self.assertEqual(r.client.calls, [])
+        r.client.ac("off")
+        r.advance(6)                                     # the next look finds it off
+        return r
+
+    def assert_paused(self, r):
+        st = r.status()
+        self.assertEqual(st["state"], "cooldown")
+        self.assertIn("Von Hand ausgeschaltet – Automatik pausiert bis das Wasser wieder kühl ist (spätestens ",
+                      st["reason"])
+        self.assertRegex(st["reason"], r"\(spätestens \d\d:\d\d\)$")
+        self.assertIsNotNone(st["manual_off_until"])
+        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 0)
+
+    def test_owned_ac_switched_off_by_hand_is_not_switched_on_again(self):
+        r = self.owned_then_off_by_hand()
+        self.assert_paused(r)
+        self.assertIsNone(r.status()["owned_since"])
+        r.advance(100)                                   # condition persists (hot water, fans high)
+        self.assertEqual(r.client.calls, [])
+        self.assert_paused(r)
+
+    def test_foreign_ac_switched_off_by_hand_is_not_switched_on_again(self):
+        r = self.foreign_then_off_by_hand()
+        self.assert_paused(r)
+        r.advance(100)
+        self.assertEqual(r.client.calls, [])
+        self.assert_paused(r)
+
+    def test_pause_ends_when_the_condition_is_interrupted_and_arms_again(self):
+        for make in (self.owned_then_off_by_hand, self.foreign_then_off_by_hand):
+            with self.subTest(make=make.__name__):
+                r = make(min_off_minutes=1)
+                r.advance(20)
+                self.assertEqual(r.client.calls, [])
+                r.set(cool())
+                self.assertIsNone(r.status()["manual_off_until"])
+                r.set(hot())
+                r.advance(4.5)
+                self.assertEqual(r.client.calls, [])     # arming again takes the full on-time
+                r.advance(1)
+                self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_any_interruption_ends_the_pause(self):
+        for name, interrupt in (("water below", snap(39.0, (30.0, 90.0, 90.0, 30.0))),
+                                ("fan below", snap(45.0, (30.0, 84.0, 90.0, 30.0))),
+                                ("water unknown", snap(None, (30.0, 90.0, 90.0, 30.0))),
+                                ("offline", hot(online=False))):
+            with self.subTest(name):
+                r = self.owned_then_off_by_hand(min_off_minutes=1)
+                r.set(interrupt)
+                self.assertIsNone(r.status()["manual_off_until"])
+
+    def test_ceiling_ends_the_pause_even_while_the_condition_persists(self):
+        for make in (self.owned_then_off_by_hand, self.foreign_then_off_by_hand):
+            with self.subTest(make=make.__name__):
+                r = make(max_switches_per_hour=10)
+                until = r.status()["manual_off_until"]
+                r.advance((until - r.now) / 60 - 0.5)
+                self.assertEqual(r.client.calls, [])
+                r.advance(1.5)
+                self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_ceiling_is_configurable_and_defaults_to_two_hours(self):
+        r = self.owned_then_off_by_hand()
+        self.assertEqual(r.status()["manual_off_until"] - r.now, 119 * MIN + 30)   # detected after 30 s
+        r = self.owned_then_off_by_hand(manual_off_pause_minutes=10)
+        self.assertEqual(r.status()["manual_off_until"] - r.now, 9 * MIN + 30)
+
+    def test_the_pause_is_logged(self):
+        r = self.owned_then_off_by_hand()
+        self.assertIn("von Hand ausgeschaltet – Automatik pausiert", r.status()["events"][0]["message"])
+        r = self.foreign_then_off_by_hand()
+        self.assertIn("von Hand ausgeschaltet – Automatik pausiert", r.status()["events"][0]["message"])
+
+    def test_an_ac_that_was_never_seen_running_is_switched_on(self):
+        r = Rig()
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_unavailable_then_off_is_not_a_manual_off(self):
+        r = Rig()
+        r.client.ac("unavailable")
+        r.tick()
+        r.advance(5.5)
+        r.client.ac("off")
+        r.advance(6)
+        self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_a_running_ac_forgotten_during_an_interruption_is_not_a_manual_off(self):
+        r = Rig()
+        r.client.ac("cool")
+        r.tick()
+        r.advance(5.5)
+        r.set(cool())                                    # interruption: what we saw is outdated
+        r.client.ac("off")
+        r.advance(2)
+        r.set(hot())
+        r.advance(5.5)
+        self.assertEqual(r.client.calls, ON_CALLS)
+
+    def test_own_switch_off_is_not_a_manual_off(self):
+        r = Rig(max_switches_per_hour=10)
+        r.bring_on()
+        r.advance(30)
+        r.set(cool())
+        r.advance(11)
+        self.assertEqual(r.client.count("climate", "turn_off"), 1)
+        self.assertIsNone(r.status()["manual_off_until"])
+        r.set(hot())
+        r.advance(25)
+        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)
+
+    def test_disabling_clears_the_pause(self):
+        r = self.owned_then_off_by_hand()
+        r.set_cfg(enabled=False)
+        r.advance(1)
+        r.set_cfg(enabled=True)
+        r.advance(1)
+        self.assertIsNone(r.status()["manual_off_until"])
+
+    def test_pending_own_off_after_a_failed_turn_off_is_not_a_manual_off(self):
+        r = Rig(max_switches_per_hour=10)
+        r.bring_on()
+        r.advance(30)
+        r.client.failing = {"climate.turn_off"}
+        r.set(cool())
+        r.advance(10)
+        self.assertEqual(r.client.count("climate", "turn_off"), 1)       # failed, but HA may have done it
+        r.client.failing = set()
+        r.client.ac("off")                                               # and indeed it did
+        r.advance(1.5)
+        self.assertEqual(r.state(), "cooldown")
+        self.assertIsNone(r.status()["manual_off_until"])
+        self.assertNotIn("Handbetrieb", r.status()["events"][0]["message"])
+        self.assertEqual(r.status()["switches_last_hour"], 2)            # switch-on + our off
+        r.set(hot())
+        r.advance(25)
+        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)  # may switch on again after the lockout
 
 
 class BackoffEscalationTest(unittest.TestCase):

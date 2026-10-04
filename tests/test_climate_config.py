@@ -89,6 +89,14 @@ class ParseClimateConfigTest(unittest.TestCase):
                 patch = {path[0]: v} if len(path) == 1 else {path[0]: {path[1]: v}}
                 self.good(patch)
 
+    def test_manual_off_pause_minutes(self):
+        self.assertEqual(parse_climate_config({}).manual_off_pause_minutes, 120)
+        self.assertEqual(self.good({"manual_off_pause_minutes": 10}).manual_off_pause_minutes, 10)
+        self.assertEqual(self.good({"manual_off_pause_minutes": 480}).manual_off_pause_minutes, 480)
+        for v in (9, 481, 0, -1, 90.5, True, "120", None):
+            with self.subTest(v=v):
+                self.bad({"manual_off_pause_minutes": v}, "manual_off_pause_minutes")
+
     def test_max_switches_per_hour(self):
         for v in (0, -1, 1.5, True, "2"):
             with self.subTest(v=v):
