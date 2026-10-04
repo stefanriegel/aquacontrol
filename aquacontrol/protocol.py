@@ -30,6 +30,18 @@ MODE_NAMES = {MODE_FIXED: "fixed", MODE_TARGET: "target", MODE_CURVE: "curve", M
 
 STRIP_FLAG_DISABLED = 0x0002
 
+LED_MODE_UNUSED = 0x00
+LED_MODE_STATIC = 0x01
+LED_MODE_COLOR_SWITCH = 0x12  # "Farbschalter": colour chosen by thresholds on a data source
+LED_FLAG_FADE = 0x0001
+LED_FLAG_BLINK = 0x0002
+LED_FLAG_BRIGHTNESS = 0x4000  # "Helligkeit nach Datenquelle"
+LED_EDITABLE_FLAGS = LED_FLAG_FADE | LED_FLAG_BLINK | LED_FLAG_BRIGHTNESS
+LED_MAX_THRESHOLDS = 5
+LED_VALUES = 12
+LED_PALETTE = 6
+LED_SOURCE_NONE = -1
+
 NUM_FANS = 4
 NUM_TEMPS = 4
 NUM_SOFT_SENSORS = 16
@@ -120,11 +132,35 @@ class Controller:
 
 @dataclass(frozen=True)
 class LedController:
+    """One 70-byte LED entry. Only the fields the editor may change are written back (see encode_settings)."""
     led_start: int
     led_count: int
     mode: int
     flags: int
-    raw: bytes  # all 70 bytes; v1 never modifies them
+    source: int                                    # s16, -1 = none
+    binding1: tuple[int, int, int, int]            # x1, x2 (source range), y1, y2
+    values: tuple[int, ...]                        # 12 x s16; Farbschalter: [0] = n thresholds, [2..1+n] = thresholds
+    palette: tuple[tuple[int, int, int], ...]      # 6 x (hue 0..1535, saturation, value)
+    raw: bytes                                     # all 70 bytes as read; never written back
+
+    @property
+    def threshold_count(self) -> int:
+        return self.values[0]
+
+    @property
+    def thresholds(self) -> tuple[int, ...]:
+        if self.mode != LED_MODE_COLOR_SWITCH:
+            return ()
+        return self.values[2:2 + max(0, min(self.values[0], LED_VALUES - 2))]
+
+    @property
+    def colors(self) -> tuple[tuple[int, int, int], ...]:
+        """The colours in use: one more than thresholds for a Farbschalter, one for a static colour."""
+        if self.mode == LED_MODE_COLOR_SWITCH:
+            return self.palette[:max(0, min(self.values[0] + 1, LED_PALETTE))]
+        if self.mode == LED_MODE_STATIC:
+            return self.palette[:1]
+        return ()
 
 
 @dataclass(frozen=True)
@@ -184,6 +220,16 @@ def check_settings_report(report: bytes) -> None:
         raise ProtocolError("settings report CRC mismatch")
 
 
+def _decode_led(p: bytes, b: int) -> LedController:
+    """Decode the 70-byte LED entry that starts at index `b` of `p` (offsets in the entry are relative to `b`)."""
+    return LedController(
+        led_start=p[b + 1], led_count=p[b + 2], mode=p[b + 3], flags=_u16(p, b + 4), source=_s16(p, b + 6),
+        binding1=(_s16(p, b + 10), _s16(p, b + 12), p[b + 14], p[b + 15]),
+        values=tuple(_s16(p, b + 22 + 2 * k) for k in range(LED_VALUES)),
+        palette=tuple((_u16(p, b + 46 + 4 * k), p[b + 48 + 4 * k], p[b + 49 + 4 * k]) for k in range(LED_PALETTE)),
+        raw=bytes(p[b:b + _LED_SIZE]))
+
+
 def decode_settings(report: bytes) -> Settings:
     check_settings_report(report)
     p = report[1:]
@@ -213,7 +259,7 @@ def decode_settings(report: bytes) -> Settings:
     leds = []
     for i in range(NUM_LEDS):
         b = _LED + i * _LED_SIZE
-        leds.append(LedController(p[b + 1], p[b + 2], p[b + 3], _u16(p, b + 4), bytes(p[b:b + _LED_SIZE])))
+        leds.append(_decode_led(p, b))
     return Settings(
         temp_offsets=tuple(_x100(_s16(p, _TEMP_OFFSETS + 2 * i)) for i in range(NUM_TEMPS)),
         fans=tuple(fans),
@@ -228,7 +274,10 @@ def decode_settings(report: bytes) -> Settings:
 def encode_settings(settings: Settings, base: bytes) -> bytes:
     """Patch the known fields of `settings` into a copy of `base` and fix the CRC.
 
-    Bytes that are not modelled (unknown areas, LED controllers) are copied from `base`.
+    Bytes that are not modelled (unknown areas) are copied from `base`. LED entries are patched only where
+    the entry differs from `base` and its mode (taken from `base`) is a Farbschalter or a static colour:
+    flags 0x0001/0x0002/0x4000, source, values[0], the threshold slots and the colours in use (Farbschalter),
+    resp. flags and colour 0 (static). Everything else in the 70 bytes comes from `base`.
     """
     check_settings_report(base)
     r = bytearray(base)
@@ -259,10 +308,81 @@ def encode_settings(settings: Settings, base: bytes) -> bytes:
         for k, (temp, pct) in enumerate(c.curve):
             put_s16(curve_base + 2 + 2 * k, _raw(temp))
             put_s16(curve_base + 34 + 2 * k, _raw(pct))
+    for i, led in enumerate(settings.leds):
+        _encode_led(r, a + _LED + i * _LED_SIZE, led)
     r[a + _STRIP_BRIGHTNESS] = settings.strip_brightness
     struct.pack_into(">H", r, a + _STRIP_FLAGS, settings.strip_flags)
     struct.pack_into(">H", r, _CRC_ABS, crc16_usb(bytes(r[1:_CRC_ABS])))
     return bytes(r)
+
+
+def _encode_led(r: bytearray, b: int, led: LedController) -> None:
+    """Patch `led` into the entry that starts at index `b` of `r`, which still holds the base report there."""
+    old = _decode_led(r, b)
+    if old.mode not in (LED_MODE_COLOR_SWITCH, LED_MODE_STATIC) or _same_led(old, led):
+        return
+    if old.flags != led.flags:
+        struct.pack_into(">H", r, b + 4, (old.flags & ~LED_EDITABLE_FLAGS) | (led.flags & LED_EDITABLE_FLAGS))
+    if old.mode == LED_MODE_STATIC:
+        if old.palette[0] != led.palette[0]:
+            _put_colour(r, b, 0, led.palette[0])
+        return
+    n = led.values[0]
+    if not 0 <= n <= LED_MAX_THRESHOLDS:
+        raise ProtocolError(f"LED controller: {n} thresholds, at most {LED_MAX_THRESHOLDS} supported")
+    if old.source != led.source:
+        struct.pack_into(">h", r, b + 6, led.source)
+    old_n = min(max(old.values[0], 0), LED_VALUES - 2)
+    if old.values[0] != n:
+        struct.pack_into(">h", r, b + 22, n)
+    for k in range(2, 2 + n):  # threshold slots in use
+        if old.values[k] != led.values[k]:
+            struct.pack_into(">h", r, b + 22 + 2 * k, led.values[k])
+    for k in range(2 + n, 2 + old_n):  # slots freed by shrinking are zeroed, like aquasuite does
+        struct.pack_into(">h", r, b + 22 + 2 * k, 0)
+    for k in range(n + 1):  # colours in use
+        if old.palette[k] != led.palette[k]:
+            _put_colour(r, b, k, led.palette[k])
+
+
+def _same_led(a: LedController, b: LedController) -> bool:
+    return (a.flags, a.source, a.values, a.palette) == (b.flags, b.source, b.values, b.palette)
+
+
+def _put_colour(r: bytearray, b: int, k: int, colour: tuple[int, int, int]) -> None:
+    h, sat, val = colour
+    struct.pack_into(">HBB", r, b + 46 + 4 * k, h, sat, val)
+
+
+def with_led(settings: Settings, index: int, *, thresholds: tuple[int, ...] | None = None,
+             colors: tuple[tuple[int, int, int], ...] | None = None, **changes) -> Settings:
+    """Copy of `settings` with LED controller `index` (0-based) changed.
+
+    `changes` are LedController fields (flags, source, values, palette ...). `thresholds` sets values[0] and the
+    threshold slots; when that grows the colour list, the new colours are copies of the last existing colour.
+    `colors` then replaces the leading palette entries. Slots freed by shrinking are zeroed only by
+    encode_settings, so the model keeps what the device reported.
+    """
+    led = replace(settings.leds[index], **changes)
+    if thresholds is not None:
+        n = len(thresholds)
+        if n > LED_VALUES - 2:
+            raise ProtocolError(f"too many thresholds ({n})")
+        values = list(led.values)
+        values[0] = n
+        values[2:2 + n] = thresholds
+        palette = list(led.palette)
+        have = max(0, min(led.values[0], LED_PALETTE - 1)) + 1  # colours in use before the change
+        for k in range(have, min(n + 1, LED_PALETTE)):
+            palette[k] = palette[have - 1]
+        led = replace(led, values=tuple(values), palette=tuple(palette))
+    if colors is not None:
+        if len(colors) > LED_PALETTE:
+            raise ProtocolError(f"too many colours ({len(colors)})")
+        led = replace(led, palette=tuple(colors) + led.palette[len(colors):])
+    leds = list(settings.leds)
+    leds[index] = led
+    return replace(settings, leds=tuple(leds))
 
 
 def with_strip(settings: Settings, *, enabled: bool | None = None, brightness: int | None = None) -> Settings:
