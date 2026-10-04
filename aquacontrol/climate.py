@@ -5,9 +5,16 @@ controller only ever switches off an AC it switched on itself and still "owns"."
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
+from typing import Callable
+
+from .ha import HAError
 
 DEFAULT_CLIMATE: dict = {
     "enabled": False,
@@ -212,3 +219,336 @@ def parse_climate_config(raw: object) -> ClimateConfig:
         min_on_minutes=_minutes(get(raw, "min_on_minutes", d), "Mindestlaufzeit"),
         min_off_minutes=_minutes(get(raw, "min_off_minutes", d), "Sperrzeit"),
         max_switches_per_hour=max_switches, ac=ac)
+
+
+# --------------------------------------------------------------------------------------------------
+# State machine
+
+log = logging.getLogger(__name__)
+
+INTERVAL_S = 30
+BACKOFF_S = (60, 300, 900)  # pause after the 1st, 2nd, 3rd (and later) consecutive Home Assistant error
+EVENT_LIMIT = 20
+HOUR_S = 3600
+UNAVAILABLE = ("unavailable", "unknown")
+
+
+def _fmt_c(v: float) -> str:
+    return f"{v:.1f} °C"
+
+
+def _minutes_left(seconds: float) -> int:
+    return max(1, math.ceil(seconds / 60))
+
+
+class ClimateController:
+    """Decides every INTERVAL_S seconds whether to switch the AC on or off. All times are epoch seconds from the
+    injected clock. State lives in memory only: after a daemon restart a running AC counts as foreign.
+
+    tick() holds the lock for its whole run (including Home Assistant calls) and publishes an immutable status
+    dict at the end, so status() never waits for a hanging Home Assistant."""
+
+    def __init__(self, get_snapshot: Callable[[], dict], client_factory: Callable[[], object | None],
+                 get_config: Callable[[], ClimateConfig], clock: Callable[[], float] = time.time):
+        self._get_snapshot = get_snapshot
+        self._client_factory = client_factory
+        self._get_config = get_config
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._owned_since: float | None = None
+        self._fingerprint: tuple | None = None
+        self._arming_since: float | None = None
+        self._off_since: float | None = None
+        self._cooldown_until = 0.0
+        self._next_poll = 0.0          # a foreign (manually running) AC is looked at again only from here on
+        self._switches: list[float] = []
+        self._failures = 0
+        self._retry_at: float | None = None
+        self._last_error: str | None = None
+        self._events: deque[tuple[float, str]] = deque(maxlen=EVENT_LIMIT)
+        self._state = "idle"
+        self._reason = "Noch kein Durchlauf"
+        self._published = self._build_status(self._clock())
+
+    # --- public -------------------------------------------------------------------------------------
+    def status(self) -> dict:
+        out = copy.deepcopy(self._published)
+        enabled = self._get_config().enabled
+        out["enabled"] = enabled
+        if not enabled:
+            out["state"], out["reason"] = "disabled", "Automatik ist deaktiviert"
+        elif out["state"] == "disabled":
+            out["state"], out["reason"] = "idle", "Aktiviert, der erste Durchlauf folgt"
+        return out
+
+    def tick(self) -> None:
+        with self._lock:
+            try:
+                self._tick(self._clock())
+            finally:
+                self._published = self._build_status(self._clock())
+
+    def run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                self.tick()
+            except Exception:  # keep running; the next cycle starts from the same in-memory state
+                log.exception("climate tick failed")
+            stop.wait(INTERVAL_S)
+
+    # --- bookkeeping --------------------------------------------------------------------------------
+    def _build_status(self, now: float) -> dict:
+        try:
+            enabled = self._get_config().enabled
+        except Exception:
+            enabled = False
+        return {
+            "enabled": enabled,
+            "state": self._state,
+            "reason": self._reason,
+            "arming_since": self._arming_since if self._owned_since is None else None,
+            "owned_since": self._owned_since,
+            "cooldown_until": self._cooldown_until if self._owned_since is None and now < self._cooldown_until else None,
+            "off_condition_since": self._off_since,
+            "retry_at": self._retry_at,
+            "last_error": self._last_error,
+            "switches_last_hour": self._switch_count(now),
+            "events": [{"t": t, "message": m} for t, m in reversed(self._events)],
+        }
+
+    def _event(self, now: float, message: str) -> None:
+        self._events.append((now, message))
+        log.info("climate: %s", message)
+
+    def _switch_count(self, now: float) -> int:
+        return len([t for t in self._switches if now - t < HOUR_S])
+
+    def _record_switch(self, now: float) -> None:
+        self._switches = [t for t in self._switches if now - t < HOUR_S] + [now]
+
+    def _ok(self) -> None:
+        self._failures, self._retry_at, self._last_error = 0, None, None
+
+    def _fail(self, now: float, what: str, error: Exception) -> None:
+        self._failures += 1
+        wait = BACKOFF_S[min(self._failures, len(BACKOFF_S)) - 1]
+        self._retry_at = now + wait
+        self._last_error = f"{what}: {error}"
+        self._reason = f"{error} – nächster Versuch in {_minutes_left(wait)} min"
+        self._event(now, f"Fehler ({what}): {error}")
+
+    def _backing_off(self, now: float) -> bool:
+        if self._retry_at is None or now >= self._retry_at:
+            return False
+        self._reason = f"Home Assistant gestört, nächster Versuch in {_minutes_left(self._retry_at - now)} min"
+        return True
+
+    @staticmethod
+    def _fingerprint_of(st: dict) -> tuple:
+        attrs = st.get("attributes")
+        attrs = attrs if isinstance(attrs, dict) else {}
+        temp = attrs.get("temperature")
+        temp = float(temp) if _is_number(temp) else None
+        return (st.get("state"), temp, attrs.get("preset_mode"))
+
+    def _read(self, now: float, client, entity_id: str) -> dict | None:
+        try:
+            st = client.get_state(entity_id)
+        except HAError as e:
+            self._fail(now, "Status abfragen", e)
+            return None
+        self._ok()
+        return st
+
+    # --- the state machine --------------------------------------------------------------------------
+    def _tick(self, now: float) -> None:
+        cfg = self._get_config()
+        if not cfg.enabled:
+            if self._owned_since is not None:
+                self._event(now, "Automatik deaktiviert, Besitz abgegeben (die Klimaanlage bleibt unverändert)")
+            self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
+            self._failures, self._retry_at = 0, None
+            self._state, self._reason = "disabled", "Automatik ist deaktiviert"
+            return
+
+        water, fans_ok, why_not = self._inputs(self._get_snapshot(), cfg)
+        on_met = water is not None and water >= cfg.on.water_c and fans_ok
+        owned = self._owned_since is not None
+        if owned:
+            self._arming_since = None
+            met = water is not None and water <= cfg.off.water_c
+            self._off_since = (self._off_since if self._off_since is not None else now) if met else None
+        else:
+            self._off_since = None
+            if on_met:
+                if self._arming_since is None:
+                    self._arming_since = now
+            else:
+                self._arming_since, self._next_poll = None, 0.0
+
+        client = self._client_factory()
+        if client is None:
+            self._state = "owned" if owned else "idle"
+            self._reason = "Home Assistant ist nicht eingerichtet (URL oder Token fehlt)"
+            return
+        if owned:
+            self._tick_owned(now, cfg, client, water)
+        else:
+            self._tick_unowned(now, cfg, client, water, why_not)
+
+    @staticmethod
+    def _inputs(snap: dict, cfg: ClimateConfig) -> tuple[float | None, bool, str]:
+        """(water temperature or None, all fan conditions met, why the on-condition is not met)."""
+        status = snap.get("status") if snap.get("online") else None
+        if not status:
+            return None, False, "QUADRO ist offline, es wird nicht eingeschaltet"
+        temps = status.get("temps") or []
+        water = temps[0] if temps else None
+        if not _is_number(water):
+            return None, False, "Wassertemperatur unbekannt, es wird nicht eingeschaltet"
+        fans = status.get("fans") or []
+        low = []
+        for ch in cfg.on.fan_channels:
+            pct = fans[ch - 1].get("percent") if ch - 1 < len(fans) else None
+            if not _is_number(pct) or pct < cfg.on.fan_percent:
+                low.append(ch)
+        if water < cfg.on.water_c:
+            why = f"Wasser {_fmt_c(water)}, Einschalten ab {_fmt_c(cfg.on.water_c)}"
+        elif low:
+            why = f"Lüfter Kanal {', '.join(map(str, low))} unter {cfg.on.fan_percent:g} %"
+        else:
+            why = ""
+        return float(water), not low, why
+
+    def _tick_owned(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
+        self._state = "owned"
+        if self._backing_off(now):
+            return
+        st = self._read(now, client, cfg.entity_id)
+        if st is None:
+            return
+        if st.get("state") in UNAVAILABLE:
+            self._reason = "Klimaanlage ist in Home Assistant gerade nicht verfügbar, es wird nichts geschaltet"
+            return
+        if self._fingerprint_of(st) != self._fingerprint:
+            self._hand_over(now, cfg, st)
+            return
+        off_at = None if self._off_since is None else self._off_since + cfg.off.minutes * 60
+        run_at = self._owned_since + cfg.min_on_minutes * 60
+        if off_at is not None and now >= off_at and now >= run_at:
+            self._turn_off(now, cfg, client, water)
+        elif off_at is None:
+            self._reason = ("Klimaanlage läuft (von aquacontrol eingeschaltet)" if water is not None else
+                            "Klimaanlage läuft, QUADRO offline oder Wasser unbekannt: bleibt an")
+        else:
+            self._reason = (f"Wasser kühl genug, Ausschalten in frühestens "
+                            f"{_minutes_left(max(off_at, run_at) - now)} min")
+
+    def _hand_over(self, now: float, cfg: ClimateConfig, st: dict) -> None:
+        self._event(now, f"Handbetrieb übernommen: Klimaanlage steht jetzt auf {st.get('state')}, "
+                         "aquacontrol schaltet nichts mehr")
+        self._owned_since = self._fingerprint = self._arming_since = self._off_since = None
+        self._cooldown_until = now + cfg.min_off_minutes * 60  # never fight a manual change straight away
+        self._state = "cooldown"
+        self._reason = f"Handbetrieb übernommen, Sperrzeit noch {cfg.min_off_minutes} min"
+
+    def _turn_off(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
+        try:
+            client.call("climate", "turn_off", {"entity_id": cfg.entity_id})
+        except HAError as e:
+            self._fail(now, "Ausschalten", e)
+            return
+        self._ok()
+        self._record_switch(now)  # counts as a switch, but is never blocked by the limit
+        self._owned_since = self._fingerprint = self._off_since = None
+        self._cooldown_until = now + cfg.min_off_minutes * 60
+        self._event(now, f"Klimaanlage ausgeschaltet (Wasser {_fmt_c(water)} ≤ {_fmt_c(cfg.off.water_c)} "
+                         f"seit {cfg.off.minutes} min)")
+        self._state = "cooldown"
+        self._reason = f"Sperrzeit nach dem Ausschalten: noch {cfg.min_off_minutes} min"
+
+    def _tick_unowned(self, now: float, cfg: ClimateConfig, client, water: float | None, why_not: str) -> None:
+        if now < self._cooldown_until:
+            self._state = "cooldown"
+            self._reason = f"Sperrzeit: Einschalten frühestens in {_minutes_left(self._cooldown_until - now)} min"
+            return
+        if self._arming_since is None:
+            self._state = "idle"
+            self._reason = why_not or "Bedingungen nicht erfüllt"
+            return
+        waited = now - self._arming_since
+        if waited < cfg.on.minutes * 60:
+            self._state = "arming"
+            self._reason = (f"Bedingung erfüllt seit {int(waited // 60)} min, "
+                            f"Einschalten nach {cfg.on.minutes} min")
+            return
+        recent = sorted(t for t in self._switches if now - t < HOUR_S)
+        if len(recent) >= cfg.max_switches_per_hour:
+            free_at = recent[len(recent) - cfg.max_switches_per_hour] + HOUR_S
+            self._state = "idle"
+            self._reason = (f"Schaltlimit erreicht ({len(recent)} Schaltvorgänge in der letzten Stunde), "
+                            f"Einschalten frühestens in {_minutes_left(free_at - now)} min")
+            return
+        self._state = "arming"
+        if now < self._next_poll:  # a manually running AC was seen recently: do not ask every cycle
+            return
+        if self._backing_off(now):
+            return
+        st = self._read(now, client, cfg.entity_id)
+        if st is None:
+            return
+        state = st.get("state")
+        if state != "off":
+            self._next_poll = now + cfg.on.minutes * 60
+            self._state = "idle"
+            self._reason = ("Klimaanlage ist in Home Assistant nicht verfügbar, es wird nichts geschaltet"
+                            if state in UNAVAILABLE else
+                            f"Klimaanlage läuft bereits (Handbetrieb, Zustand {state}), aquacontrol schaltet nichts")
+            return
+        self._turn_on(now, cfg, client, water)
+
+    def _turn_on(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
+        ac, e = cfg.ac, cfg.entity_id
+        steps = [
+            ("climate", "set_hvac_mode", {"entity_id": e, "hvac_mode": ac.hvac_mode}),
+            ("climate", "set_temperature", {"entity_id": e, "temperature": ac.temperature}),
+            ("climate", "set_preset_mode", {"entity_id": e, "preset_mode": ac.preset}),
+            ("climate", "set_fan_mode", {"entity_id": e, "fan_mode": ac.fan_mode}),
+            ("select", "select_option", {"entity_id": cfg.horizontal_select, "option": ac.horizontal}),
+            ("select", "select_option", {"entity_id": cfg.vertical_select, "option": ac.vertical}),
+        ]
+        done, error = 0, None
+        for domain, service, data in steps:
+            try:
+                client.call(domain, service, data)
+            except HAError as ex:
+                error = ex
+                break
+            done += 1
+        if done:
+            self._record_switch(now)  # a half-done switch-on counts as well
+        st, read_error = None, None
+        if done:
+            try:
+                st = client.get_state(e)
+            except HAError as ex:
+                read_error = ex
+        if error is not None:
+            self._fail(now, "Einschalten", error)
+        elif read_error is not None:
+            self._fail(now, "Status nach dem Einschalten", read_error)
+        else:
+            self._ok()
+        if st is not None and st.get("state") not in ("off", *UNAVAILABLE):
+            self._owned_since, self._fingerprint = now, self._fingerprint_of(st)
+            self._arming_since = self._off_since = None
+            part = "" if error is None else f" (unvollständig: {done} von {len(steps)} Schritten)"
+            self._event(now, f"Klimaanlage eingeschaltet{part} (Wasser {_fmt_c(water)}, "
+                             f"Lüfter ≥ {cfg.on.fan_percent:g} %)")
+            self._state = "owned"
+            if error is None:
+                self._reason = "Klimaanlage eingeschaltet, aquacontrol hat den Besitz"
+        elif done:
+            self._arming_since = now  # not confirmed: start the on-time over instead of hammering the cloud
+            self._event(now, "Einschalten nicht bestätigt: Klimaanlage meldet weiterhin keinen Betrieb")
+            self._state = "arming"
