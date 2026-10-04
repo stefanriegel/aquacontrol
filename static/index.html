@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aquacontrol</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>aquacontrol</h1>
+  <span id="online" class="pill">…</span>
+  <span id="water" class="big">–</span>
+</header>
+<nav>
+  <button data-tab="overview" class="active">Übersicht</button>
+  <button data-tab="fans">Lüfter</button>
+  <button data-tab="leds">LEDs</button>
+  <button data-tab="schedule">Zeitplan</button>
+  <button data-tab="backups">Backups</button>
+</nav>
+<main>
+  <section id="tab-overview">
+    <div id="tiles" class="grid"></div>
+    <h2>Temperaturen</h2>
+    <div id="sensors" class="grid"></div>
+    <h2>Verlauf <select id="hist-range"><option value="60">1 h</option><option value="180">3 h</option><option value="360">6 h</option></select></h2>
+    <div id="series" class="series"></div>
+    <svg id="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+  </section>
+  <section id="tab-fans" hidden><div id="fan-editors"></div></section>
+  <section id="tab-leds" hidden>
+    <div class="card">
+      <h3>LED-Strip</h3>
+      <label><input type="checkbox" id="strip-on"> eingeschaltet</label>
+      <label>Helligkeit <input type="range" id="strip-bright" min="0" max="255"> <output id="strip-bright-val"></output></label>
+      <button id="strip-save">Speichern</button> <span class="msg" id="strip-msg"></span>
+    </div>
+    <h2>LED-Controller</h2>
+    <p class="hint">Farben und Schwellwerte je Gerät werden nach dem Reverse Engineering hier bearbeitbar.</p>
+    <div id="led-list" class="grid"></div>
+  </section>
+  <section id="tab-schedule" hidden>
+    <div class="card" id="sched-status"></div>
+    <table id="rules"><thead><tr><th>Uhrzeit</th><th>Tage</th><th>Aktion</th><th>Helligkeit</th><th></th></tr></thead><tbody></tbody></table>
+    <button id="rule-add">Regel hinzufügen</button>
+    <button id="rules-save">Zeitplan speichern</button> <span class="msg" id="rules-msg"></span>
+  </section>
+  <section id="tab-backups" hidden>
+    <p class="hint">Vor jeder Änderung wird das Geräteprofil gesichert. „pinned“-Backups werden nie automatisch gelöscht.</p>
+    <table id="backup-list"><thead><tr><th>Name</th><th></th></tr></thead><tbody></tbody></table>
+    <span class="msg" id="backup-msg"></span>
+  </section>
+</main>
+</body>
+</html>
