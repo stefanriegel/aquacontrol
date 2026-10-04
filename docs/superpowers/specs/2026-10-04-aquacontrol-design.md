@@ -12,6 +12,8 @@ Ein kleiner Daemon `aquacontrol` läuft direkt auf dem Host und bietet per Web-O
   Zieltemperatur, Kurvenpunkte, Min/Max
 - Bearbeiten der LED-Einstellungen, die im QUADRO gespeichert sind (pro Gerät, „Farbe nach Temperatur“)
 - **Zeitplan für die LEDs:** An/Aus und Helligkeit nach Uhrzeit, z. B. 01:00 aus und 09:00 an
+- **Weitere Temperaturen nur zur Anzeige:** Host-Sensoren per hwmon (CPU k10temp, NVMe, RAM spd5118,
+  iGPU amdgpu) und die beiden RTX 3090 aus VM 103, die ihre Werte selbst an aquacontrol schickt (§3.4b)
 - Backups des Geräteprofils und Wiederherstellung
 
 **Erfolgskriterium:**
@@ -26,7 +28,8 @@ Ein kleiner Daemon `aquacontrol` läuft direkt auf dem Host und bietet per Web-O
 - MQTT, Home Assistant, aquasuite-web-Cloudexport (laut Nutzer nicht mehr gebraucht)
 - Lüfter- oder LED-Regelung im Sekundentakt auf dem Host: das Gerät regelt selbst, siehe §2. Die einzige
   Laufzeitaufgabe des Daemons ist der LED-Zeitplan mit wenigen Schreibvorgängen pro Tag.
-- Software-Sensoren (Host-Temperaturen an den QUADRO senden)
+- Software-Sensoren (Host- oder GPU-Temperaturen an den QUADRO senden, damit Kurven darauf regeln). Die
+  Temperaturen werden in v1 nur angezeigt; die Lüfter regeln weiter nach der Wassertemperatur.
 - Datenhaltung über einen Neustart hinaus (Langzeit-Verlauf, Datenbank)
 - Firmware-Updates, Umbenennen von Sensoren im Gerät (Report 0x08)
 
@@ -97,6 +100,7 @@ aquacontrol/
     validate.py   # Sicherheitsregeln für Änderungen
     monitor.py    # Hintergrund-Thread: Input-Reports → aktueller Zustand + Ringpuffer
     backups.py    # Backup-Dateien anlegen/listen/laden
+    sensors.py    # Host-hwmon-Temperaturen + Speicher für extern gepushte Sensoren
     schedule.py   # LED-Zeitplan: Soll-Zustand zu einer Uhrzeit berechnen, Scheduler-Thread
     config.py     # daemon.json + config.json laden/prüfen/atomar schreiben
     web.py        # HTTPS-Server, Basic-Auth, JSON-API, statische Dateien
@@ -150,6 +154,29 @@ Jede Einheit hat eine Aufgabe und lässt sich ohne Hardware testen. Die einzige 
 Geschrieben wird **nur** auf ausdrückliche Nutzeraktion („Speichern“, „Wiederherstellen“) oder bei einem
 Zeitplan-Wechsel (§3.4a), nie periodisch. Das schont den Flash.
 
+### 3.4b Weitere Temperaturen (sensors.py) – nur Anzeige
+
+- **Host:** `sensors.py` liest alle `/sys/class/hwmon/hwmon*/temp*_input` außer `name == quadro`, dessen
+  Daten aus hidraw kommen.
+  - Kennung ist `"<name>/<label>"`, z. B. `k10temp/Tctl` oder `nvme/Composite`. Gibt es kein Label, gilt
+    `temp1` usw.
+  - Lesefehler (`ENODATA`) überspringt er.
+  - Die Config kann Sensoren umbenennen und ausblenden: `host_sensors: {"k10temp/Tctl": "CPU",
+    "spd5118/temp1": null}`, wobei `null` ausblendet.
+  - Gelesen wird im Monitor-Takt; die Werte kommen mit in den Verlauf.
+- **GPUs aus VM 103 (Push):**
+  - Die RTX 3090 hängen per Passthrough an `vfio-pci` und sind auf dem Host unsichtbar.
+  - In VM 103 läuft ein systemd-Timer (`deploy/push-gpu/`) alle 5 s: `nvidia-smi --query-gpu=index,
+    temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits` → `POST /api/external`.
+  - Authentifiziert wird mit einem eigenen Bearer-Token je Quelle. In `daemon.json` steht nur der
+    SHA-256-Hash unter `push_tokens: {"llm-vm": "<hash>"}`.
+  - Dem TLS-Zertifikat vertraut die VM über die PVE-CA (`/etc/pve/pve-root-ca.pem`, `curl --cacert`).
+  - Body: `{"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "GPU 0", "value": 45.0, "unit": "°C"},
+    …]}`, höchstens 32 Sensoren. Erlaubte Einheiten: °C, W und %.
+  - Die Werte liegen nur im Speicher. Älter als 30 s gelten sie als „keine Daten“, z. B. wenn VM 103 aus ist.
+  - Temperaturen kommen mit in den Verlauf.
+  - Ein Token darf nur unter seiner eigenen `source` schreiben.
+
 ### 3.4a schedule.py – LED-Zeitplan
 
 - **Regeln** stehen in der Config: Liste von `{ "time": "HH:MM", "days": [0..6] (optional, Standard täglich),
@@ -188,7 +215,8 @@ Zeitplan-Wechsel (§3.4a), nie periodisch. Das schont den Flash.
   `python3 -m aquacontrol set-password` erzeugt ihn.
 - Lauscht standardmäßig auf `0.0.0.0:8443`.
 - API (JSON):
-  - `GET /api/status`: aktueller Zustand
+  - `GET /api/status`: aktueller Zustand (QUADRO, Host-Sensoren, externe Sensoren)
+  - `POST /api/external`: Push externer Sensoren, mit Bearer-Token statt Basic-Auth (§3.4b)
   - `GET /api/history?minutes=N`: Verlauf
   - `GET /api/settings`: dekodierte Einstellungen (Lüfter, Kurven, LEDs, Strip) samt Namen aus der Config
   - `PUT /api/settings/fan/{1-4}`: Modus, Fest-%, Zieltemperatur, Sensor, 16 Kurvenpunkte, Min/Max
@@ -202,7 +230,8 @@ Zeitplan-Wechsel (§3.4a), nie periodisch. Das schont den Flash.
 ### 3.6 Oberfläche
 
 Eine Seite mit drei Bereichen:
-- **Übersicht:** Wassertemperatur, Durchfluss, je Lüfter Drehzahl und %, Verlauf als SVG-Liniendiagramm.
+- **Übersicht:** Wassertemperatur, Durchfluss, je Lüfter Drehzahl und %. Dazu CPU, NVMe, RAM und GPU 0/1
+  (mit „keine Daten“, wenn veraltet). Verlauf als SVG-Liniendiagramm mit wählbaren Kurven.
 - **Lüfter:** je Kanal der Modus (Fest / Zieltemperatur / Kurve). Bei Zieltemperatur ein Eingabefeld für
   °C, bei Kurve ein Kurveneditor (16 ziehbare Punkte in SVG plus Tabelle). Min/Max sind editierbar, der
   aktuelle Arbeitspunkt wird angezeigt. PID-Parameter (P/I/D) und Fallback werden nur angezeigt.
@@ -222,7 +251,8 @@ Zwei Dateien mit klar getrennten Zuständigkeiten:
 **`/etc/aquacontrol/daemon.json`** (0640 root:aquacontrol, nur vom Admin gepflegt, vom Daemon nur gelesen):
 
 ```json
-{ "listen": "0.0.0.0", "port": 8443, "password_hash": "pbkdf2_sha256$..." }
+{ "listen": "0.0.0.0", "port": 8443, "password_hash": "pbkdf2_sha256$...",
+  "push_tokens": { "llm-vm": "sha256-hex-des-tokens" } }
 ```
 
 **`/var/lib/aquacontrol/config.json`** (Eigentümer aquacontrol; der Daemon schreibt sie bei Zeitplan-Änderungen
@@ -233,6 +263,7 @@ Zwei Dateien mit klar getrennten Zuständigkeiten:
   "fans": {"1": {"name": "Pumpe", "min_percent": 25}, "2": {"name": "140mm Radiator"},
            "3": {"name": "420mm Radiator"}, "4": {"name": "Gehäuselüfter"}},
   "sensors": {"1": "Wasser Temp"},
+  "host_sensors": {"k10temp/Tctl": "CPU", "nvme/Composite": "NVMe"},
   "leds": {"1": "…", "2": "…"},
   "schedule": [
     {"time": "01:00", "target": "strip", "on": false},
@@ -256,7 +287,8 @@ Die Namen in `leds` kommen aus §5. Fehlt die Datei, legt `install.sh` sie mit d
 - Modus nur aus {Fest, Zieltemperatur, Kurve}. „Folgen“ (4) bleibt unverändert, wenn es schon gesetzt ist,
   ist aber nicht neu wählbar.
 - Strip-Helligkeit 0–255.
-- Kurvensensor nur aus den physischen Sensoren 1–4 oder dem Durchfluss.
+- Kurvensensor nur aus den physischen Sensoren 1–4 (Index 0–3). Den Index für den Durchfluss haben wir
+  nicht verifiziert, er wird abgelehnt, sofern er nicht schon gesetzt ist.
 - Änderungen an Bytes außerhalb der bekannten Felder sind unmöglich, weil `encode` sie aus `base` kopiert.
 
 ## 5. LED-Reverse-Engineering (Teil der Umsetzung, vor dem LED-Editor)
@@ -333,6 +365,7 @@ vor). Vorgehen:
 | Pumpe auf 0 % | `min_percent`-Regel, durchgesetzt im Server. |
 | Flash-Verschleiß | Schreiben nur auf Nutzeraktion oder Zeitplan-Wechsel (ca. 2/Tag), kein Schreiben ohne Änderung. |
 | Strip-Flag `0x0002` bedeutet nicht „aus“ wie erwartet | Hardware-Test 5. Fallback: Helligkeit 0 als „aus“. |
+| Push-Endpunkt wird missbraucht | Eigenes Token je Quelle (nur als Hash gespeichert), Größen- und Wertgrenzen, nur Anzeige ohne Wirkung aufs Gerät. |
 | Daemon zur Schaltzeit nicht aktiv | Nachholen beim Start; der Zustand ist im Gerät gespeichert, LEDs bleiben bis dahin im letzten Zustand. |
 | Web-Oberfläche auf dem Hypervisor | Härtung per systemd, eigener User ohne Root-Rechte, TLS und Passwort, nur Zugriff auf hidraw. |
 | Konflikt zwischen hwmon-Treiber und hidraw | Der Daemon liest pwm nicht über sysfs, damit keine konkurrierenden Feature-Reads entstehen. Steuer-Operationen laufen im Daemon über ein Lock. |
