@@ -32,6 +32,19 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 UMask=0027
+# ProcSubset=pid hides only procfs files outside /proc/<pid>; hwmon and hidraw live in sysfs, unaffected.
+# No PrivateDevices=: it would hide /dev/hidraw* (access comes from DevicePolicy/DeviceAllow above).
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+PrivateIPC=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
