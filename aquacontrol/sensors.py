@@ -1,17 +1,17 @@
 """Display-only temperatures: host hwmon sensors and values pushed by other machines."""
 from __future__ import annotations
 
-import math
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 EXTERNAL_MAX_SENSORS = 32
 EXTERNAL_MAX_AGE_S = 30.0
 EXTERNAL_UNITS = ("°C", "W", "%")
-_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_ID_RE = re.compile(r"[a-z0-9_-]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -27,12 +27,19 @@ def _natural(path: Path) -> tuple[str, int]:
     return (m.group(1), int(m.group(2) or 0)) if m else (path.name, 0)
 
 
+def _device_id(hw: Path) -> str:
+    """Basename of the resolved <hwmonN>/device link (e.g. "1-0051"), else the hwmon dir name."""
+    link = hw / "device"
+    return link.resolve().name if link.exists() else hw.name
+
+
 def read_host_sensors(labels: dict[str, str | None], sys_root: str | Path = "/sys/class/hwmon") -> list[Reading]:
     """All hwmon temperatures except the QUADRO's. `labels` renames (str) or hides (None)."""
     out: list[Reading] = []
     root = Path(sys_root)
     if not root.is_dir():
         return out
+    found = []  # (hwmon dir, chip name, label, input file)
     for hw in sorted(root.iterdir(), key=_natural):
         try:
             name = (hw / "name").read_text().strip()
@@ -46,14 +53,21 @@ def read_host_sensors(labels: dict[str, str | None], sys_root: str | Path = "/sy
                 label = (hw / f"{chan}_label").read_text().strip()
             except OSError:
                 label = chan
-            sid = f"{name}/{label}"
-            if sid in labels and labels[sid] is None:
-                continue
-            try:
-                value = int(inp.read_text().strip()) / 1000
-            except (OSError, ValueError):
-                continue  # e.g. ENODATA for an unconnected sensor
-            out.append(Reading(sid, labels.get(sid) or sid, value, "°C"))
+            found.append((hw, name, label, inp))
+    # Ids must be unique and stable across reboots (hwmonN numbering is not): when "<name>/<label>"
+    # occurs more than once, every member becomes "<name>@<dev>/<label>" (dev = bus address of the device).
+    counts = Counter(f"{name}/{label}" for _, name, label, _ in found)
+    for hw, name, label, inp in found:
+        sid = f"{name}/{label}"
+        if counts[sid] > 1:
+            sid = f"{name}@{_device_id(hw)}/{label}"
+        if sid in labels and labels[sid] is None:
+            continue
+        try:
+            value = int(inp.read_text().strip()) / 1000
+        except (OSError, ValueError):
+            continue  # e.g. ENODATA for an unconnected sensor
+        out.append(Reading(sid, labels.get(sid) or sid, value, "°C"))
     return out
 
 
@@ -76,16 +90,20 @@ class ExternalStore:
         if not isinstance(sensors, list) or not 0 < len(sensors) <= EXTERNAL_MAX_SENSORS:
             raise ExternalError(f"sensors muss eine Liste mit 1–{EXTERNAL_MAX_SENSORS} Einträgen sein")
         readings = []
+        seen: set[str] = set()
         for s in sensors:
             if not isinstance(s, dict):
                 raise ExternalError("Sensor-Eintrag muss ein Objekt sein")
             sid, label, value, unit = s.get("id"), s.get("label", s.get("id")), s.get("value"), s.get("unit")
-            if not isinstance(sid, str) or not _ID_RE.match(sid):
+            if not isinstance(sid, str) or not _ID_RE.fullmatch(sid):
                 raise ExternalError(f"ungültige Sensor-id {sid!r}")
+            if sid in seen:
+                raise ExternalError(f"Sensor-id {sid!r} kommt mehrfach vor")
+            seen.add(sid)
             if not isinstance(label, str) or len(label) > 40:
                 raise ExternalError(f"ungültiges label für {sid}")
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
-                    or not -50 <= value <= 1000:
+            # the range check also rejects nan/inf and huge ints (math.isfinite would overflow on 10**400)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not -50 <= value <= 1000:
                 raise ExternalError(f"ungültiger Wert für {sid}")
             if unit not in EXTERNAL_UNITS:
                 raise ExternalError(f"Einheit für {sid} muss eine von {EXTERNAL_UNITS} sein")

@@ -41,6 +41,29 @@ class HostSensorsTest(unittest.TestCase):
         self.assertEqual(ids["k10temp/Tctl"], "CPU")
         self.assertNotIn("spd5118/temp1", ids)
 
+    def test_duplicate_ids_get_device_suffix(self):
+        root = Path(self.tmp.name, "dup")
+        root.mkdir()
+        devs = Path(self.tmp.name, "devs")
+        for n, (idx, dev) in enumerate([(0, "1-0051"), (1, "1-0053")]):
+            hwmon(root, idx, "spd5118", {"temp1": (None, "4%d000" % (n + 1))})
+            (devs / dev).mkdir(parents=True)
+            (root / f"hwmon{idx}" / "device").symlink_to(devs / dev)
+        hwmon(root, 2, "nvme", {"temp1": ("Composite", "40000")})
+        r = read_host_sensors({"spd5118@1-0053/temp1": "DIMM B"}, root)
+        self.assertEqual([x.id for x in r], ["spd5118@1-0051/temp1", "spd5118@1-0053/temp1", "nvme/Composite"])
+        self.assertEqual([x.label for x in r][:2], ["spd5118@1-0051/temp1", "DIMM B"])
+        self.assertEqual([x.value for x in r][:2], [41.0, 42.0])
+        self.assertEqual(read_host_sensors({"spd5118@1-0051/temp1": None}, root)[0].id, "spd5118@1-0053/temp1")
+
+    def test_duplicate_without_device_link_uses_hwmon_name(self):
+        root = Path(self.tmp.name, "dup")
+        root.mkdir()
+        hwmon(root, 3, "spd5118", {"temp1": (None, "41000")})
+        hwmon(root, 7, "spd5118", {"temp1": (None, "42000")})
+        self.assertEqual([x.id for x in read_host_sensors({}, root)],
+                         ["spd5118@hwmon3/temp1", "spd5118@hwmon7/temp1"])
+
     def test_missing_root(self):
         self.assertEqual(read_host_sensors({}, "/nonexistent"), [])
 
@@ -77,6 +100,17 @@ class ExternalStoreTest(unittest.TestCase):
         for body in bad:
             with self.subTest(body=str(body)[:60]), self.assertRaises(ExternalError):
                 self.store.put("llm-vm", body)
+
+    def test_rejects_huge_int_and_trailing_newline_id(self):
+        for sid, value in (("g", 10**400), ("g\n", 1)):
+            body = {"source": "llm-vm", "sensors": [{"id": sid, "value": value, "unit": "°C"}]}
+            with self.subTest(sid=sid, value=str(value)[:8]), self.assertRaises(ExternalError):
+                self.store.put("llm-vm", body)
+
+    def test_rejects_duplicate_ids_in_payload(self):
+        s = {"id": "gpu0", "value": 1, "unit": "°C"}
+        with self.assertRaises(ExternalError):
+            self.store.put("llm-vm", {"source": "llm-vm", "sensors": [s, dict(s, value=2)]})
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ class BackupStoreTest(unittest.TestCase):
             self.store.save(self.report[:-1])
 
     def test_load_rejects_traversal_and_missing(self):
-        for bad in ("../etc/passwd", "a/b.bin", "x.txt", ""):
+        for bad in ("../etc/passwd", "a/b.bin", "x.txt", "", "ok.bin\n"):
             with self.subTest(bad=bad), self.assertRaises(BackupError):
                 self.store.load(bad)
         with self.assertRaises(BackupError):

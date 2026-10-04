@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .protocol import check_settings_report
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.bin$")
+_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+\.bin")
 
 
 class BackupError(ValueError):
@@ -50,12 +50,12 @@ class BackupStore:
         if not self.dir.exists():
             return []
         items = [BackupInfo(f.name, f.stat().st_size, f.name.startswith("pinned_"))
-                 for f in self.dir.iterdir() if _NAME_RE.match(f.name)]
+                 for f in self.dir.iterdir() if _NAME_RE.fullmatch(f.name)]
         # newest first; pinned and normal names both start with a sortable timestamp
         return sorted(items, key=lambda b: b.name.removeprefix("pinned_"), reverse=True)
 
     def load(self, name: str) -> bytes:
-        if not _NAME_RE.match(name):
+        if not _NAME_RE.fullmatch(name):
             raise BackupError(f"ungültiger Backup-Name {name!r}")
         path = self.dir / name
         if not path.is_file():

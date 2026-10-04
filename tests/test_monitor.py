@@ -49,7 +49,8 @@ class MonitorTest(unittest.TestCase):
         def boom():
             raise OSError("hwmon gone")
         mon = Monitor(open_reader=lambda: None, extra=boom, clock=self.clock)
-        mon.ingest(self.status)
+        with self.assertLogs("aquacontrol.monitor", "ERROR"):
+            mon.ingest(self.status)
         self.assertTrue(mon.snapshot()["online"])
 
     def test_run_survives_missing_device(self):
@@ -61,7 +62,8 @@ class MonitorTest(unittest.TestCase):
             stop.set()
             raise OSError("no device")
 
-        Monitor(open_reader=opener, clock=self.clock).run(stop)
+        with self.assertLogs("aquacontrol.monitor", "WARNING"):
+            Monitor(open_reader=opener, clock=self.clock).run(stop)
         self.assertEqual(calls, [1])
 
     def test_run_ingests_from_reader(self):

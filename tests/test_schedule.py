@@ -1,8 +1,9 @@
+import threading
 import unittest
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from aquacontrol import protocol as p
-from aquacontrol.device import Device
+from aquacontrol.device import Device, DeviceError
 from aquacontrol.fake import FakeTransport
 from aquacontrol.schedule import (Override, Rule, ScheduleError, Scheduler, StripState, desired_state,
                                   next_change, parse_rules, rules_to_json)
@@ -37,6 +38,10 @@ class ParseTest(unittest.TestCase):
         for raw in bad:
             with self.subTest(raw=raw), self.assertRaises(ScheduleError):
                 parse_rules(raw)
+
+    def test_rejects_trailing_newline_in_time(self):
+        with self.assertRaises(ScheduleError):
+            parse_rules([{"time": "09:00\n", "on": True}])
 
 
 class DesiredStateTest(unittest.TestCase):
@@ -113,6 +118,83 @@ class SchedulerTest(unittest.TestCase):
         st = self.sched.status()
         self.assertEqual(st["desired"], {"on": False, "brightness": None})
         self.assertEqual(st["next_change"], "2026-10-05T09:00")
+
+
+class BackoffTest(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeTransport(load("settings_live.bin"))
+        self.dev = Device(self.fake, None, make_check({0: 25.0}))
+        self.now = at(5, 3, 0)
+        self.rules = NIGHT
+        self.sched = Scheduler(self.dev, lambda: self.rules, clock=lambda: self.now)
+        self.fake.ignore_writes = True  # every write attempt fails verification (and is rolled back)
+
+    def attempt(self):
+        """Tick once; returns how many writes reached the device (2 per failed attempt: write + rollback)."""
+        before = len(self.fake.writes)
+        try:
+            self.sched.tick()
+        except DeviceError:
+            pass
+        return len(self.fake.writes) - before
+
+    def test_failure_pauses_writes_for_5_minutes(self):
+        self.assertEqual(self.attempt(), 2)
+        self.assertIn("Schreiben fehlgeschlagen", self.sched.last_error)
+        self.now += timedelta(minutes=4, seconds=59)
+        self.assertEqual(self.attempt(), 0)
+        self.assertIsNone(self.sched.tick())
+        self.assertIn("Schreiben fehlgeschlagen", self.sched.status()["last_error"])  # kept while backing off
+        self.now += timedelta(seconds=1)
+        self.assertEqual(self.attempt(), 2)
+
+    def test_backoff_grows_5_15_60_and_stays_at_60(self):
+        for minutes in (5, 15, 60, 60):
+            self.assertEqual(self.attempt(), 2)
+            self.now += timedelta(minutes=minutes) - timedelta(seconds=1)
+            self.assertEqual(self.attempt(), 0, minutes)
+            self.now += timedelta(seconds=1)
+
+    def test_rules_change_resets_backoff(self):
+        self.assertEqual(self.attempt(), 2)
+        self.assertEqual(self.attempt(), 0)
+        self.rules = parse_rules([{"time": "01:00", "target": "strip", "on": False, "brightness": 50}])
+        self.assertEqual(self.attempt(), 2)
+
+    def test_override_resets_backoff(self):
+        self.assertEqual(self.attempt(), 2)
+        self.assertEqual(self.attempt(), 0)
+        self.sched.set_override(False)  # same state as the rule, but a manual change: tried right away
+        self.assertEqual(self.attempt(), 2)
+
+    def test_success_resets_failure_count(self):
+        self.assertEqual(self.attempt(), 2)           # 1st failure -> 5 min
+        self.now += timedelta(minutes=5)
+        self.assertEqual(self.attempt(), 2)           # 2nd failure -> 15 min
+        self.now += timedelta(minutes=15)
+        self.fake.ignore_writes = False
+        self.assertEqual(self.attempt(), 1)           # success
+        self.assertIsNone(self.sched.last_error)
+        self.now = at(5, 9, 0)
+        self.fake.ignore_writes = True
+        self.assertEqual(self.attempt(), 2)           # fails again: back to 5 min, not 60
+        self.now += timedelta(minutes=5)
+        self.assertEqual(self.attempt(), 2)
+
+    def test_run_survives_failure_and_does_not_hammer(self):
+        class Stop(threading.Event):  # wait() returns at once; stops after 3 rounds
+            rounds = 0
+
+            def wait(self, timeout=None):
+                self.rounds += 1
+                if self.rounds >= 3:
+                    self.set()
+                return self.is_set()
+
+        with self.assertLogs("aquacontrol.schedule", "WARNING"):
+            self.sched.run(Stop())
+        self.assertEqual(len(self.fake.writes), 2)  # one failed attempt, then paused
+        self.assertIn("Schreiben fehlgeschlagen", self.sched.last_error)
 
 
 if __name__ == "__main__":

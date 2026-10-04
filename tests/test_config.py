@@ -62,6 +62,27 @@ class AppConfigTest(unittest.TestCase):
         self.assertEqual(len(cfg.rules()), 2)
         self.assertEqual(cfg.led_name(0, "LED Controller 1"), "LED Controller 1")
 
+    def _cfg(self, raw):
+        self.path.write_text(json.dumps(raw))
+        return AppConfig(self.path)
+
+    def test_min_percent_partial_config_keeps_pump_floor(self):
+        self.assertEqual(self._cfg({"schedule": []}).min_percent(), {0: 25.0})
+        self.assertEqual(self._cfg({"fans": {"2": {"name": "x"}}}).min_percent(), {0: 25.0})
+
+    def test_min_percent_valid_value_wins(self):
+        cfg = self._cfg({"fans": {"1": {"min_percent": 30}, "3": {"min_percent": 12.5}}})
+        self.assertEqual(cfg.min_percent(), {0: 30.0, 2: 12.5})
+
+    def test_min_percent_ignores_invalid(self):
+        for bad in (-5, 150, "x", True, None, float("nan")):
+            with self.subTest(bad=bad):
+                cfg = self._cfg({"fans": {"1": {"min_percent": bad}, "2": {"min_percent": bad}}})
+                self.assertEqual(cfg.min_percent(), {0: 25.0})
+        cfg = self._cfg({"fans": {"0": {"min_percent": 10}, "abc": {"min_percent": 10},
+                                  "9": {"min_percent": 10}, "4": "kaputt"}})
+        self.assertEqual(cfg.min_percent(), {0: 25.0})
+
     def test_set_rules_persists_atomically(self):
         cfg = AppConfig(self.path)
         cfg.set_rules([{"time": "22:00", "target": "strip", "on": False}])

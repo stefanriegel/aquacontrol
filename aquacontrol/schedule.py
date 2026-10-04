@@ -13,8 +13,10 @@ from .protocol import with_strip
 
 log = logging.getLogger(__name__)
 
-_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_TIME_RE = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 ALL_DAYS = frozenset(range(7))  # Monday = 0, like datetime.weekday()
+# Pause before the next device write after the 1st, 2nd, 3rd (and later) consecutive failure.
+BACKOFF = (timedelta(minutes=5), timedelta(minutes=15), timedelta(minutes=60))
 
 
 class ScheduleError(ValueError):
@@ -49,7 +51,7 @@ def parse_rules(raw: object) -> list[Rule]:
     for n, item in enumerate(raw, 1):
         if not isinstance(item, dict):
             raise ScheduleError(f"Regel {n}: muss ein Objekt sein")
-        m = _TIME_RE.match(str(item.get("time", "")))
+        m = _TIME_RE.fullmatch(str(item.get("time", "")))
         if not m:
             raise ScheduleError(f"Regel {n}: Uhrzeit muss HH:MM sein")
         target = item.get("target", "strip")
@@ -122,21 +124,45 @@ class Scheduler:
         self._override: Override | None = None
         self._lock = threading.Lock()
         self.last_error: str | None = None
+        self._failures = 0                       # consecutive failed writes
+        self._retry_at: datetime | None = None   # no device write before this time
+        self._rules_used: list[Rule] | None = None
 
     def set_override(self, on: bool, brightness: int | None = None) -> None:
         with self._lock:
             self._override = Override(StripState(on, brightness), self._clock())
+            self._failures, self._retry_at = 0, None  # a manual change is tried right away
 
     def tick(self):
+        """Apply the desired state. tick() itself keeps the write backoff (so it is testable via the
+        injected clock): while backing off it returns None and leaves last_error untouched."""
         now = self._clock()
+        rules = list(self._get_rules())
         with self._lock:
             override = self._override
-        state = desired_state(self._get_rules(), now, override)
+            if rules != self._rules_used:  # new rules are tried right away
+                self._rules_used = rules
+                self._failures, self._retry_at = 0, None
+            if self._retry_at is not None and now < self._retry_at:
+                return None
+        state = desired_state(rules, now, override)
         if state is None:
+            self.last_error = None
             return None
-        return self._device.apply(
-            lambda s: with_strip(s, enabled=state.on, brightness=state.brightness),
-            backup=False, reason="schedule")
+        try:
+            result = self._device.apply(
+                lambda s: with_strip(s, enabled=state.on, brightness=state.brightness),
+                backup=False, reason="schedule")
+        except Exception as e:
+            with self._lock:
+                self._failures += 1
+                self._retry_at = now + BACKOFF[min(self._failures, len(BACKOFF)) - 1]
+            self.last_error = str(e)
+            raise
+        with self._lock:
+            self._failures, self._retry_at = 0, None
+        self.last_error = None
+        return result
 
     def status(self) -> dict:
         now = self._clock()
@@ -158,8 +184,6 @@ class Scheduler:
         while not stop.is_set():
             try:
                 self.tick()
-                self.last_error = None
-            except Exception as e:  # keep running; the UI shows the error
-                self.last_error = str(e)
+            except Exception as e:  # keep running; tick() recorded last_error and the backoff
                 log.warning("schedule tick failed: %s", e)
             stop.wait(60 - self._clock().second + 1)

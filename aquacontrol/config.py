@@ -100,10 +100,15 @@ class AppConfig:
         return self._raw.get("fans", {}).get(str(index + 1), {}).get("name") or fallback
 
     def min_percent(self) -> dict[int, float]:
-        out = {}
-        for key, fan in self._raw.get("fans", {}).items():
-            if isinstance(fan, dict) and isinstance(fan.get("min_percent"), (int, float)):
-                out[int(key) - 1] = float(fan["min_percent"])
+        # The pump floor (fan 1) always exists; other values count only if valid.
+        out = {0: float(DEFAULT_APP_CONFIG["fans"]["1"]["min_percent"])}
+        fans = self._raw.get("fans", {})
+        for key, fan in (fans.items() if isinstance(fans, dict) else ()):
+            if key not in ("1", "2", "3", "4") or not isinstance(fan, dict):
+                continue
+            value = fan.get("min_percent")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 100:
+                out[int(key) - 1] = float(value)
         return out
 
     def sensor_name(self, index: int, fallback: str) -> str:
