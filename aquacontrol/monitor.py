@@ -1,5 +1,6 @@
 """Live state and in-memory history. The QUADRO pushes a status report about once a
-second; host and external sensors are sampled alongside it."""
+second; host and external sensors are sampled on their own cadence, so they keep
+updating while the QUADRO is offline."""
 from __future__ import annotations
 
 import logging
@@ -16,6 +17,7 @@ log = logging.getLogger(__name__)
 
 OFFLINE_AFTER_S = 5.0
 RETRY_S = 5.0
+EXTRA_INTERVAL_S = 2.0  # cadence of host/external sensor sampling
 
 
 class Reader(Protocol):
@@ -33,43 +35,56 @@ class Monitor:
         self._lock = threading.Lock()
         self._latest: tuple[float, Status] | None = None
         self._extra_latest: list[Reading] = []
+        self._extra_at: float | None = None
         self._history: deque[dict] = deque(maxlen=history_s // bucket_s)
         self._bucket: tuple[int, dict[str, list[float]]] | None = None
 
     def ingest(self, report: bytes, now: float | None = None) -> None:
         now = self._clock() if now is None else now
         status = decode_status(report)
+        self.poll_extra(now)
+        with self._lock:
+            self._latest = (now, status)
+            values = self._bucket_values(now)
+
+            def add(key: str, v: float | None) -> None:
+                if v is not None:
+                    values.setdefault(key, []).append(v)
+
+            for i, t in enumerate(status.temps):
+                add(f"temp{i + 1}", t)
+            add("flow", status.flow_lph)
+            for i, f in enumerate(status.fans):
+                add(f"fan{i + 1}_rpm", f.rpm)
+                add(f"fan{i + 1}_percent", f.percent)
+
+    def poll_extra(self, now: float | None = None) -> None:
+        """Sample host/external sensors if EXTRA_INTERVAL_S have passed since the last sample.
+        Independent of the QUADRO: °C values go into the history either way."""
+        now = self._clock() if now is None else now
+        with self._lock:
+            if self._extra_at is not None and now - self._extra_at < EXTRA_INTERVAL_S:
+                return
         try:
             extra = self._extra()
         except Exception:  # sensor glitches must never stop the monitor
             log.exception("reading extra sensors failed")
             extra = []
         with self._lock:
-            self._latest = (now, status)
+            self._extra_at = now
             self._extra_latest = extra
-            self._add_to_bucket(now, status, extra)
+            values = self._bucket_values(now)
+            for r in extra:
+                if r.unit == "°C":
+                    values.setdefault(r.id, []).append(r.value)
 
-    def _add_to_bucket(self, now: float, status: Status, extra: list[Reading]) -> None:
+    def _bucket_values(self, now: float) -> dict[str, list[float]]:
         start = int(now // self._bucket_s * self._bucket_s)
         if self._bucket is not None and self._bucket[0] != start:
             self._finish_bucket()
         if self._bucket is None:
             self._bucket = (start, {})
-        values = self._bucket[1]
-
-        def add(key: str, v: float | None) -> None:
-            if v is not None:
-                values.setdefault(key, []).append(v)
-
-        for i, t in enumerate(status.temps):
-            add(f"temp{i + 1}", t)
-        add("flow", status.flow_lph)
-        for i, f in enumerate(status.fans):
-            add(f"fan{i + 1}_rpm", f.rpm)
-            add(f"fan{i + 1}_percent", f.percent)
-        for r in extra:
-            if r.unit == "°C":
-                add(r.id, r.value)
+        return self._bucket[1]
 
     def _finish_bucket(self) -> None:
         start, values = self._bucket
@@ -79,14 +94,15 @@ class Monitor:
     def snapshot(self) -> dict:
         now = self._clock()
         with self._lock:
+            sensors = [asdict(r) for r in self._extra_latest]
             if self._latest is None:
-                return {"online": False, "updated": None, "status": None, "sensors": []}
+                return {"online": False, "updated": None, "status": None, "sensors": sensors}
             ts, status = self._latest
             return {
                 "online": now - ts <= OFFLINE_AFTER_S,
                 "updated": ts,
                 "status": asdict(status),
-                "sensors": [asdict(r) for r in self._extra_latest],
+                "sensors": sensors,
             }
 
     def history(self, minutes: int) -> list[dict]:
@@ -94,13 +110,22 @@ class Monitor:
         with self._lock:
             return [h for h in self._history if h["t"] >= cutoff]
 
+    def _idle(self, stop: threading.Event, seconds: float) -> None:
+        """Wait up to `seconds`, sampling the extra sensors meanwhile."""
+        end = time.monotonic() + seconds
+        while True:
+            self.poll_extra()
+            remaining = end - time.monotonic()
+            if remaining <= 0 or stop.wait(min(1.0, remaining)):
+                return
+
     def run(self, stop: threading.Event) -> None:
         while not stop.is_set():
             try:
                 reader = self._open_reader()
             except OSError as e:
                 log.warning("status reader unavailable: %s", e)
-                stop.wait(RETRY_S)
+                self._idle(stop, RETRY_S)
                 continue
             try:
                 while not stop.is_set():
@@ -110,8 +135,9 @@ class Monitor:
                             self.ingest(data)
                         except ProtocolError as e:
                             log.warning("bad status report: %s", e)
+                    self.poll_extra()
             except OSError as e:
                 log.warning("status reader lost: %s", e)
             finally:
                 reader.close()
-            stop.wait(RETRY_S)
+            self._idle(stop, RETRY_S)

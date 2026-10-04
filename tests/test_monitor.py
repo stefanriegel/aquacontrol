@@ -53,6 +53,80 @@ class MonitorTest(unittest.TestCase):
             mon.ingest(self.status)
         self.assertTrue(mon.snapshot()["online"])
 
+    def test_extra_sensors_refresh_without_quadro(self):
+        snap = self.mon.snapshot()
+        self.assertFalse(snap["online"])
+        self.assertEqual(snap["sensors"], [])
+        self.mon.poll_extra()
+        snap = self.mon.snapshot()
+        self.assertFalse(snap["online"])  # online refers to the QUADRO only
+        self.assertIsNone(snap["status"])
+        self.assertEqual(snap["sensors"][0]["value"], 51.0)
+        self.extra = [Reading("k10temp/Tctl", "CPU", 55.0, "°C")]
+        self.clock.t += 1
+        self.mon.poll_extra()  # not due yet (2 s cadence)
+        self.assertEqual(self.mon.snapshot()["sensors"][0]["value"], 51.0)
+        self.clock.t += 1
+        self.mon.poll_extra()
+        self.assertEqual(self.mon.snapshot()["sensors"][0]["value"], 55.0)
+
+    def test_extra_sensors_keep_filling_history_while_quadro_is_offline(self):
+        self.mon.ingest(self.status)
+        for _ in range(30):
+            self.clock.t += 1
+            self.mon.poll_extra()
+        self.assertFalse(self.mon.snapshot()["online"])
+        hist = self.mon.history(60)
+        self.assertGreaterEqual(len(hist), 2)
+        self.assertEqual(hist[-1]["k10temp/Tctl"], 51.0)
+        self.assertNotIn("temp1", hist[-1])  # the QUADRO values stopped
+
+    def test_ingest_does_not_double_count_extras(self):
+        self.mon.ingest(self.status, now=self.clock.t)
+        self.extra = [Reading("k10temp/Tctl", "CPU", 99.0, "°C")]
+        self.mon.ingest(self.status, now=self.clock.t + 1)  # extras not due: cached value stays
+        self.assertEqual(self.mon.snapshot()["sensors"][0]["value"], 51.0)
+
+    def test_run_polls_extras_while_reader_times_out_and_when_device_is_missing(self):
+        calls = []
+        stop = threading.Event()
+
+        class Idle:
+            def read(self, timeout):
+                stop.wait(0.01)
+                return None
+
+            def close(self):
+                pass
+
+        def extra():
+            calls.append(1)
+            if len(calls) >= 3:
+                stop.set()
+            return [Reading("k10temp/Tctl", "CPU", 51.0, "°C")]
+
+        ticks = iter(range(0, 1000, 3))  # every call of the clock advances 3 s: always due
+        mon = Monitor(open_reader=Idle, extra=extra, clock=lambda: float(next(ticks)))
+        mon.run(stop)
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertFalse(mon.snapshot()["online"])
+        self.assertEqual(mon.snapshot()["sensors"][0]["label"], "CPU")
+
+        calls.clear()
+        stop2 = threading.Event()
+
+        def opener():
+            raise OSError("no device")
+
+        def extra2():
+            calls.append(1)
+            stop2.set()
+            return []
+
+        with self.assertLogs("aquacontrol.monitor", "WARNING"):
+            Monitor(open_reader=opener, extra=extra2, clock=self.clock).run(stop2)
+        self.assertEqual(calls, [1])
+
     def test_run_survives_missing_device(self):
         calls = []
         stop = threading.Event()
