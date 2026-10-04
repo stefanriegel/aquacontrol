@@ -213,8 +213,14 @@ class App:
                     isinstance(pt, list) and len(pt) == 2 for pt in curve):
                 raise BadRequest("curve muss 16 Paare [Temperatur, Prozent] enthalten")
             pts = []
-            for t, pct in curve:
-                pts.append((_number({"v": t}, "v"), _number({"v": pct}, "v")))
+            for n, (t, pct) in enumerate(curve, 1):
+                pair = []
+                for value, what in ((t, "Temperatur"), (pct, "Prozent")):
+                    try:
+                        pair.append(_number({"v": value}, "v"))
+                    except BadRequest:
+                        raise BadRequest(f"Kurvenpunkt {n}: {what} muss eine Zahl sein") from None
+                pts.append(tuple(pair))
             ctrl["curve"] = tuple(pts)
 
         def mutate(s: p.Settings) -> p.Settings:

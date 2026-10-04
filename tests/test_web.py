@@ -125,6 +125,18 @@ class WebTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(self.fake.writes, [])
 
+    def test_bad_curve_point_names_the_point_and_field(self):
+        curve = [[20 + i, 10 + 5 * i] for i in range(16)]
+        for point, field, bad, expected in ((2, 0, "a", "Kurvenpunkt 3: Temperatur muss eine Zahl sein"),
+                                            (4, 1, None, "Kurvenpunkt 5: Prozent muss eine Zahl sein"),
+                                            (0, 0, True, "Kurvenpunkt 1: Temperatur muss eine Zahl sein")):
+            with self.subTest(expected=expected):
+                c = [list(pt) for pt in curve]
+                c[point][field] = bad
+                status, resp = self.req("PUT", "/api/settings/fan/3", {"mode": "curve", "curve": c})
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"], expected)
+
     def test_device_absent_is_502(self):
         self.fake.present = False
         status, body = self.req("GET", "/api/settings")
