@@ -1,3 +1,5 @@
+import contextlib
+import io
 import struct
 import tempfile
 import unittest
@@ -45,6 +47,33 @@ class UsbmonTest(unittest.TestCase):
         self.assertEqual([(r.report_type, r.report_id) for r in reports], [("feature", 3), ("output", 2)])
         self.assertEqual(reports[0].data, report)
         self.assertEqual(reports[1].data, commit)
+
+    def _parse(self, raw: bytes, devnum=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "x.pcap")
+            path.write_bytes(raw)
+            return parse_pcap(path, devnum)
+
+    def test_truncated_file_is_not_a_pcap(self):
+        with self.assertRaisesRegex(ValueError, "not a pcap"):
+            self._parse(b"\xd4\xc3\xb2")
+        with self.assertRaisesRegex(ValueError, "not a pcap"):
+            self._parse(b"")
+
+    def test_devnum_filter_keeps_only_chosen_device(self):
+        setup = struct.pack("<BBHHH", 0x21, 0x09, 0x0202, 1, 2)
+        raw = pcap([usbmon_packet("S", 2, setup, b"\x01\x02", dev=3),
+                    usbmon_packet("S", 2, setup, b"\x03\x04", dev=7)])
+        self.assertEqual([r.data for r in self._parse(raw)], [b"\x01\x02", b"\x03\x04"])
+        self.assertEqual([r.data for r in self._parse(raw, devnum=7)], [b"\x03\x04"])
+
+    def test_wlength_mismatch_is_skipped_with_warning(self):
+        setup = struct.pack("<BBHHH", 0x21, 0x09, 0x0303, 1, 961)
+        raw = pcap([usbmon_packet("S", 2, setup, b"\x00" * 100)])   # snaplen-truncated
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            reports = self._parse(raw)
+        self.assertEqual(reports, [])
+        self.assertIn("skipping", err.getvalue())
 
     def test_diff_labels_led_offsets(self):
         a = load("settings_live.bin")

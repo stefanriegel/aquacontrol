@@ -19,12 +19,16 @@ temperatures (host hwmon sensors, values pushed from other machines) for referen
 ## Install (Proxmox host, as root)
 
 ```bash
-rsync -a --exclude .git ./ root@pve:/root/aquacontrol-src/
+rsync -a --exclude .git --exclude dev --exclude .superpowers --exclude __pycache__ \
+    ./ root@pve:/root/aquacontrol-src/
 ssh root@pve /root/aquacontrol-src/deploy/install.sh
 ssh root@pve 'cd /opt/aquacontrol && python3 -m aquacontrol set-password && systemctl restart aquacontrol'
 ```
 
 Web UI: `https://<host>:8443/` (user name is ignored, password as set).
+
+The web UI uses the PVE node certificate (or `pveproxy-ssl.pem` if both it and its key exist). The
+certificate is loaded when the service starts, so after PVE renews it run `systemctl restart aquacontrol`.
 
 Before the first change, store a pinned backup of the device settings:
 
@@ -39,7 +43,17 @@ cd /opt/aquacontrol && python3 -m aquacontrol add-push-token llm-vm   # prints t
 systemctl restart aquacontrol
 ```
 
-On the sending machine install `deploy/push-gpu/` (script, service, timer) and create
+On the sending machine (VM 103), as root, with the repo checked out there:
+
+```bash
+install -m 0755 deploy/push-gpu/aquacontrol-push-gpu.sh /usr/local/bin/
+install -m 0644 deploy/push-gpu/aquacontrol-push-gpu.service deploy/push-gpu/aquacontrol-push-gpu.timer /etc/systemd/system/
+scp root@<pve-host>:/etc/pve/pve-root-ca.pem /etc/aquacontrol-ca.pem
+install -m 0600 /dev/null /etc/aquacontrol-push.env      # then fill it, see below
+systemctl daemon-reload
+systemctl enable --now aquacontrol-push-gpu.timer
+```
+
 `/etc/aquacontrol-push.env` (mode 0600):
 
 ```
@@ -47,6 +61,11 @@ AQUACONTROL_URL=https://<pve-host>:8443
 AQUACONTROL_TOKEN=<token>
 AQUACONTROL_CA=/etc/aquacontrol-ca.pem
 ```
+
+The host in `AQUACONTROL_URL` must match a subject alternative name (SAN) of the PVE certificate.
+If it does not (for example a bare IP), use the node's host name there and make it resolve in the VM
+(DNS or an `/etc/hosts` entry).
+Check with `systemctl status aquacontrol-push-gpu.service` and `journalctl -u aquacontrol-push-gpu`.
 
 ## Development
 
@@ -57,8 +76,21 @@ python3 -m aquacontrol --daemon-config dev/daemon.json --app-config dev/config.j
     run --fake tests/fixtures --no-tls --listen 127.0.0.1 --port 18443
 ```
 
-`dev/daemon.json` needs a `password_hash` (create one with
-`python3 -c 'from aquacontrol.auth import hash_password; print(hash_password("devpassword1"))'`).
+`dev/` is git-ignored, so create the dev configs once after checkout:
+
+```bash
+mkdir -p dev/backups
+python3 - <<'EOF'
+import json
+from aquacontrol.auth import hash_password
+from aquacontrol.config import DEFAULT_APP_CONFIG
+json.dump({"listen": "127.0.0.1", "port": 18443, "password_hash": hash_password("devpassword1"),
+           "push_tokens": {}}, open("dev/daemon.json", "w"), indent=2)
+json.dump({**DEFAULT_APP_CONFIG, "backup_dir": "dev/backups"}, open("dev/config.json", "w"), indent=2)
+EOF
+```
+
+Without `dev/config.json` pointing `backup_dir` at a local path, writes try `/var/lib/aquacontrol/backups`.
 
 Test fixtures are real device reports. Status reports must have the device serial zeroed
 (`tools/make_fixture.py` does that); the settings and names reports contain no serial.

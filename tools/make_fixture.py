@@ -13,14 +13,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aquacontrol.protocol import STATUS_REPORT_ID, STATUS_REPORT_LEN, scrub_status_serial  # noqa: E402
-from aquacontrol.transport import HidrawReader  # noqa: E402
+from aquacontrol.transport import DeviceUnavailable, HidrawReader  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2 or argv[0] != "status":
         print(__doc__)
         return 1
-    reader = HidrawReader()
+    try:
+        reader = HidrawReader()
+    except (DeviceUnavailable, OSError) as e:
+        print(f"cannot open the QUADRO hidraw device ({e}). Is it plugged in, and are you root?", file=sys.stderr)
+        return 1
     try:
         for _ in range(10):
             data = reader.read(2.0)
