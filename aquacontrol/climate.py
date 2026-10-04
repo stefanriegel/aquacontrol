@@ -1,6 +1,6 @@
 """Climate automation: switch the room air conditioner (via Home Assistant) on when the water cooling
 runs at its limit for a while, and off again when the water is clearly cooler. See
-docs/superpowers/specs/2026-10-04-aquacontrol-climate-design.md. Manual operation always wins: the
+docs/design/climate-design.md. Manual operation always wins: the
 controller only ever switches off an AC it switched on itself and still "owns"."""
 from __future__ import annotations
 
