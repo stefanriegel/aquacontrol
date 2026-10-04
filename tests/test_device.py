@@ -175,6 +175,19 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(self.fake.settings, backup)
         self.assertEqual(self.backups.load(result.backup), self.original)  # the state before is saved
 
+    def test_restore_warns_when_it_changes_the_sensor_offsets(self):
+        backup = self._patched(lambda r: r.__setitem__(slice(10, 12), (150).to_bytes(2, "big")))
+        with self.assertLogs("aquacontrol.device", "WARNING") as cm:
+            self.dev.restore(backup)
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("Sensor-Offsets", cm.output[0])
+        self.assertIn("Sensor 1", cm.output[0])
+
+    def test_restore_without_offset_changes_does_not_warn(self):
+        self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0))
+        with self.assertNoLogs("aquacontrol.device", "WARNING"):
+            self.dev.restore(self.original)
+
     def test_restore_still_checks_pump_and_fans(self):
         pump_low = p.encode_settings(p.with_fan(p.decode_settings(self.original), 0, min_percent=10.0), self.original)
         with self.assertRaises(ValidationError) as cm:

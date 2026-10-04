@@ -105,9 +105,14 @@ class Device:
             self._ensure_open()
             old_report = self._read_report()
             old = decode_settings(old_report)
-            self._check(old, _known_state(old, decode_settings(report)))
+            restored = decode_settings(report)
+            self._check(old, _known_state(old, restored))
             if report == old_report:
                 return ApplyResult(changed=False)
+            changed = [str(i + 1) for i, (a, b) in enumerate(zip(old.temp_offsets, restored.temp_offsets)) if a != b]
+            if changed:  # the offsets shift the temperatures the fan and pump curves see
+                log.warning("Wiederherstellung ändert die Sensor-Offsets (Sensor %s): die Kurven sehen dadurch "
+                            "andere Temperaturen", ", ".join(changed))
             return self._write_verified(old_report, report, True, reason)
 
     def rewrite_current(self) -> None:
