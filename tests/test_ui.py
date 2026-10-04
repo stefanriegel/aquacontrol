@@ -224,6 +224,11 @@ class ClimateChoicesTest(unittest.TestCase):
         self.assertEqual(run_js("choiceOptions", [[], "x"]), [["x", "x (gespeichert)"]])
         self.assertEqual(run_js("choiceOptions", [["a", "a", "b"], "a"]), [["a", "a"], ["b", "b"]])
 
+    def test_inherited_object_properties_are_not_labels(self):
+        self.assertEqual(run_js("choiceOptions", [["constructor", "toString"], "__proto__", {"cool": "Kühlen"}]),
+                         [["__proto__", "__proto__ (gespeichert)"], ["constructor", "constructor"],
+                          ["toString", "toString"]])
+
     def test_options_can_have_nicer_labels(self):
         self.assertEqual(run_js("choiceOptions", [["cool", "dry"], "dry", {"cool": "Kühlen"}]),
                          [["cool", "Kühlen"], ["dry", "dry"]])
@@ -388,6 +393,74 @@ class CspTest(unittest.TestCase):
         self.assertIn('id="tab-climate"', html)
         self.assertIn("Klima", html)
         self.assertIn("Verbindung testen", html)
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class ChartGeometryTest(unittest.TestCase):
+    """Verlauf: the x-axis spans the selected window, ticks are round times, gaps break the line."""
+
+    NOW = 1_700_000_000
+
+    def test_window_is_the_selected_range_ending_now(self):
+        for minutes in (60, 180, 360):
+            self.assertEqual(run_js("chartWindow", [minutes, self.NOW]), [self.NOW - minutes * 60, self.NOW])
+
+    def ticks(self, minutes, now=NOW, tz=0):
+        t0, t1 = run_js("chartWindow", [minutes, now])
+        return run_js("chartTicks", [minutes, t0, t1, tz])
+
+    def test_ticks_every_15_30_60_minutes_on_round_times(self):
+        now = 1_700_000_000 - 1_700_000_000 % 3600 + 600  # 10 minutes past a full hour
+        h = now - 600
+        self.assertEqual(self.ticks(60, now), [h - 2700, h - 1800, h - 900, h])
+        self.assertEqual(self.ticks(180, now), [h - 1800 * i for i in range(5, -1, -1)])
+        self.assertEqual(self.ticks(360, now), [h - 3600 * i for i in range(5, -1, -1)])
+
+    def test_ticks_are_round_in_local_time(self):
+        # UTC+5:30: a tick every 30 minutes falls on :00/:30 local, i.e. on :30/:00 UTC
+        tz = 5 * 3600 + 1800
+        for t in self.ticks(180, tz=tz):
+            self.assertEqual((t + tz) % 1800, 0)
+        # UTC+1 with 1 h steps: on the full local hour
+        for t in self.ticks(360, tz=3600):
+            self.assertEqual((t + 3600) % 3600, 0)
+
+    def test_tick_counts_per_range(self):
+        self.assertIn(len(self.ticks(60)), (4, 5))
+        self.assertIn(len(self.ticks(180)), (6, 7))
+        self.assertIn(len(self.ticks(360)), (6, 7))
+
+    def pts(self, *times):
+        return [{"t": t, "v": float(i)} for i, t in enumerate(times)]
+
+    def test_a_long_pause_breaks_the_line(self):
+        runs = run_js("chartSegments", [self.pts(100, 110, 120, 400, 410), 0, 1000, 30])
+        self.assertEqual([[p["t"] for p in r] for r in runs], [[100, 110, 120], [400, 410]])
+
+    def test_exactly_three_buckets_apart_is_not_a_gap(self):
+        runs = run_js("chartSegments", [self.pts(100, 130, 161), 0, 1000, 30])
+        self.assertEqual([[p["t"] for p in r] for r in runs], [[100, 130], [161]])
+
+    def test_old_points_are_clipped_to_the_window(self):
+        runs = run_js("chartSegments", [self.pts(10, 20, 500, 510, 520, 2000), 500, 1000, 30])
+        self.assertEqual([[p["t"] for p in r] for r in runs], [[500, 510, 520]])
+        self.assertEqual(run_js("chartSegments", [self.pts(10, 20), 500, 1000, 30]), [])
+        self.assertEqual(run_js("chartSegments", [[], 500, 1000, 30]), [])
+
+    def test_clipping_a_gap_neighbour_does_not_bridge_it(self):
+        runs = run_js("chartSegments", [self.pts(100, 110, 600, 610), 500, 1000, 30])
+        self.assertEqual([[p["t"] for p in r] for r in runs], [[600, 610]])
+
+    def test_a_single_point_is_a_run_of_one(self):
+        self.assertEqual(len(run_js("chartSegments", [self.pts(700), 500, 1000, 30])), 1)
+
+    def test_label_anchor_keeps_labels_inside_the_edges(self):
+        anchor = lambda x: run_js("chartLabelAnchor", [x, 6, 394, 16])
+        self.assertEqual(anchor(6), "start")
+        self.assertEqual(anchor(394), "end")
+        self.assertEqual(anchor(200), "middle")
+        self.assertEqual(anchor(21), "start")
+        self.assertEqual(anchor(380), "end")
 
 
 if __name__ == "__main__":

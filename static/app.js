@@ -121,10 +121,108 @@ function seriesLabel(key) {
   return r ? r.label : key;
 }
 
+let historyRequest = 0;
 async function refreshHistory() {
+  const minutes = Number($("#hist-range").value);
+  const mine = ++historyRequest;
   let data;
   try {
-    data = await api("GET", `/api/history?minutes=${$("#hist-range").value}`);
+    data = await api("GET", `/api/history?minutes=${minutes}`);
+  } catch { return; }
+  if (mine !== historyRequest) return; // a newer request (e.g. another range) is already on its way
+  const keys = [...new Set(data.flatMap((d) => Object.keys(d)))]
+    .filter((k) => k !== "t" && !k.endsWith("_rpm") && !k.endsWith("_percent") && k !== "flow");
+  const series = $("#series");
+  series.replaceChildren();
+  keys.forEach((k, i) => {
+    const color = `var(${COLORS[i % COLORS.length]})`;
+    const cb = el("input", { type: "checkbox", checked: !hiddenSeries.has(k) });
+    cb.addEventListener("change", () => {
+      cb.checked ? hiddenSeries.delete(k) : hiddenSeries.add(k);
+      localStorageSet("hiddenSeries", JSON.stringify([...hiddenSeries]));
+      refreshHistory();
+    });
+    const sw = el("span", { class: "swatch" });
+    sw.style.background = color;
+    series.append(el("label", {}, cb, sw, seriesLabel(k)));
+  });
+  const newest = data.length ? data[data.length - 1].t : 0;
+  drawChart($("#chart"), data, keys.filter((k) => !hiddenSeries.has(k)), keys, minutes, Math.max(newest, Date.now() / 1000));
+}
+
+// The chart's x-axis always spans the selected window [now - minutes, now], not just the data that exists.
+const CHART_GAP_S = 30; // history buckets are 10 s: more than 3 buckets between two points is a gap (e.g. a restart)
+
+function chartWindow(minutes, now) {
+  return [now - minutes * 60, now];
+}
+
+// Time ticks inside [t0, t1], aligned to round local clock times: every 15 min (1 h), 30 min (3 h), 60 min (6 h).
+function chartTicks(minutes, t0, t1, tzOffsetS = -new Date(t0 * 1000).getTimezoneOffset() * 60) {
+  const step = minutes <= 60 ? 900 : minutes <= 180 ? 1800 : 3600;
+  const ticks = [];
+  for (let t = Math.ceil((t0 + tzOffsetS) / step) * step - tzOffsetS; t <= t1; t += step) ticks.push(t);
+  return ticks;
+}
+
+// Points [{t, v}] (time-ordered) clipped to [t0, t1] and split into runs wherever two neighbours are more than maxGap apart.
+function chartSegments(points, t0, t1, maxGap) {
+  const runs = [];
+  let run = null;
+  for (const p of points) {
+    if (p.t < t0 || p.t > t1) continue;
+    if (run && p.t - run[run.length - 1].t <= maxGap) run.push(p);
+    else { run = [p]; runs.push(run); }
+  }
+  return runs;
+}
+
+// Where a label at x is anchored: start/end near the edges so it is not cut off at the viewBox, middle otherwise.
+function chartLabelAnchor(x, left, right, margin) {
+  return x < left + margin ? "start" : x > right - margin ? "end" : "middle";
+}
+
+function drawChart(root, data, visible, allKeys, minutes, now) {
+  root.replaceChildren();
+  const W = 800, H = 260, L = 40, B = 20, T = 10;
+  const [t0, t1] = chartWindow(minutes, now);
+  const runs = Object.fromEntries(visible.map((k) => [k, chartSegments(
+    data.filter((d) => d[k] !== undefined).map((d) => ({ t: d.t, v: d[k] })), t0, t1, CHART_GAP_S)]));
+  const vals = visible.flatMap((k) => runs[k].flat().map((p) => p.v));
+  if (vals.length === 0) {
+    root.append(Object.assign(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }), { textContent: "Noch zu wenig Daten" }));
+    return;
+  }
+  const lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
+  const x = (t) => L + ((t - t0) / (t1 - t0)) * (W - L - 5);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo || 1)) * (H - T - B);
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + ((hi - lo) * i) / 4;
+    root.append(svg("line", { x1: L, x2: W, y1: y(v), y2: y(v), class: "gridline" }));
+    root.append(Object.assign(svg("text", { x: 4, y: y(v) + 4 }), { textContent: `${v.toFixed((hi - lo) / 4 < 1 ? 1 : 0)}°` }));
+  }
+  for (const t of chartTicks(minutes, t0, t1)) {
+    const label = new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+    root.append(svg("line", { x1: x(t), x2: x(t), y1: T, y2: H - B, class: "gridline" }));
+    root.append(Object.assign(svg("text", { x: x(t), y: H - 4, "text-anchor": chartLabelAnchor(x(t), L, W, 20) }), { textContent: label }));
+  }
+  for (const k of visible) {
+    const color = `var(${COLORS[allKeys.indexOf(k) % COLORS.length]})`;
+    for (const run of runs[k]) {
+      if (run.length === 1) {
+        const dot = svg("circle", { cx: x(run[0].t).toFixed(1), cy: y(run[0].v).toFixed(1), r: 2.5 });
+        dot.style.fill = color;
+        root.append(dot);
+        continue;
+      }
+      const line = svg("polyline", { points: run.map((p) => `${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" "), fill: "none", "stroke-width": 2 });
+      line.style.stroke = color;
+      root.append(line);
+    }
+  }
+}
+
+$("#hist-range").value}`);
   } catch { return; }
   const keys = [...new Set(data.flatMap((d) => Object.keys(d)))]
     .filter((k) => k !== "t" && !k.endsWith("_rpm") && !k.endsWith("_percent") && k !== "flow");
@@ -142,7 +240,8 @@ async function refreshHistory() {
     sw.style.background = color;
     series.append(el("label", {}, cb, sw, seriesLabel(k)));
   });
-  drawChart($("#chart"), data, keys.filter((k) => !hiddenSeries.has(k)), keys);
+  const newest = data.length ? data[data.length - 1].t : 0;
+  drawChart($("#chart"), data, keys.filter((k) => !hiddenSeries.has(k)), keys, minutes, Math.max(newest, Date.now() / 1000));
 }
 
 function drawChart(root, data, visible, allKeys) {
@@ -425,8 +524,8 @@ function ledPreview(state) {
     bar.append(svg("rect", { x: x(seg.from), y: Y, width: Math.max(0, x(seg.to) - x(seg.from)), height: H, fill: seg.color }));
   }
   bar.append(svg("rect", { x: X0, y: Y, width: X1 - X0, height: H, fill: "none", stroke: "currentColor", "stroke-opacity": 0.35 }));
-  const label = (v, anchor, cls = "") => {
-    const t = svg("text", { x: x(v), y: 62, "text-anchor": anchor, class: cls });
+  const label = (v, anchor) => {
+    const t = svg("text", { x: x(v), y: 62, "text-anchor": anchor });
     t.textContent = String(v);
     bar.append(t);
   };
@@ -436,7 +535,7 @@ function ledPreview(state) {
   for (const t of state.thresholds) {
     if (!Number.isFinite(t)) continue;
     bar.append(svg("line", { x1: x(t), x2: x(t), y1: Y - 3, y2: Y + H + 3, stroke: "currentColor", "stroke-width": 2 }));
-    label(t, "middle");
+    label(t, chartLabelAnchor(x(t), X0, X1, 16));
   }
   const now = state.now;
   if (now !== undefined && now !== null) {
@@ -703,7 +802,7 @@ const STATE_TEXT = { idle: "Bereit", arming: "Einschalt-Bedingung läuft", owned
 // [value, label] pairs for a drop-down. The saved value stays selectable even if the list lacks it (marked).
 // `labels` is an object {value: text} or a function value -> text (undefined = show the raw value).
 function choiceOptions(list, saved, labels = {}) {
-  const text = (v) => (typeof labels === "function" ? labels(v) : labels[v]) || v;
+  const text = (v) => (typeof labels === "function" ? labels(v) : Object.hasOwn(labels, v) ? labels[v] : undefined) || v;
   const items = [...new Set(list)].map((v) => [v, text(v)]);
   if (saved !== null && saved !== undefined && saved !== "" && !list.includes(saved)) items.unshift([saved, `${text(saved)} (gespeichert)`]);
   return items;
