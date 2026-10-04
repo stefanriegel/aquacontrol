@@ -13,6 +13,7 @@ temperatures (host hwmon sensors, values pushed from other machines) for referen
 - No schedule rules are installed by default, so a fresh install never writes to the device on its own; add rules in the UI
 - The commit report is sent as a HID feature report like the kernel driver (`commit_as="output"` on `HidrawTransport` switches to an output report)
 - Every write to the device: fresh read → CRC check → backup (except LED strip changes, see below) → write → commit → read-back verify → rollback on mismatch
+- The Verlauf (history, 10 s buckets, 6 h) survives restarts: it is saved every 5 minutes and on shutdown to `history.json.gz` next to `config.json` (`/var/lib/aquacontrol`); a missing or corrupt file just means an empty history
 - Backups: fan changes, LED editor changes and restores create a backup first. LED strip on/off and brightness changes (made by the scheduler or a manual override) create none (by design, they are frequent and harmless); saving schedule rules does not write to the device at all
 
 > Protocol knowledge builds on [TimSC/quadroctl](https://github.com/TimSC/quadroctl) and the

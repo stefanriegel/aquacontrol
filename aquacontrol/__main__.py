@@ -30,6 +30,15 @@ SHUTDOWN_JOIN_S = 90  # systemd's default stop timeout; a switch-on talks to Hom
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
 
+SHUTDOWN_MONITOR_JOIN_S = 10  # the monitor loop wakes up at least every second
+HISTORY_FILE = "history.json.gz"
+
+
+def history_path(args) -> Path:
+    """The saved history lives next to config.json (so --fake dev runs write into dev/)."""
+    return Path(args.app_config).parent / HISTORY_FILE
+
+
 def build(args) -> tuple[Device, Monitor, Scheduler, BackupStore, AppConfig, ExternalStore]:
     config = AppConfig(args.app_config)
     backups = BackupStore(config.backup_dir, config.backup_keep)
@@ -45,7 +54,8 @@ def build(args) -> tuple[Device, Monitor, Scheduler, BackupStore, AppConfig, Ext
     device = Device(transport, backups, make_check(config.min_percent()))
     try:
         externals = ExternalStore()
-        monitor = Monitor(open_reader, extra=lambda: read_host_sensors(config.host_sensor_labels()) + externals.current())
+        monitor = Monitor(open_reader, extra=lambda: read_host_sensors(config.host_sensor_labels()) + externals.current(),
+                          history_path=history_path(args))
         scheduler = Scheduler(device, config.rules)
     except BaseException:
         device.close()  # the device exists: do not leave it open
@@ -82,6 +92,7 @@ def cmd_run(args) -> int:
     # From here on the device exists: every way out of this function closes it (see `finally`).
     threads: list[threading.Thread] = []
     server = serving = None
+    history_loaded = False  # never overwrite the saved history with an empty one if startup failed before the load
     failure: list[BaseException] = []
     try:
         climate, ha_client_factory = build_climate(monitor, config)
@@ -97,6 +108,8 @@ def cmd_run(args) -> int:
         host = args.listen or daemon.listen
         port = args.port or daemon.port
         server = make_server(app, host, port, cert, key)
+        monitor.load_history(history_path(args))  # before the monitor thread starts
+        history_loaded = True
         threads.append(threading.Thread(target=monitor.run, args=(stop,), name="monitor", daemon=True))
         if not args.no_schedule:
             threads.append(threading.Thread(target=scheduler.run, args=(stop,), name="scheduler", daemon=True))
@@ -130,6 +143,14 @@ def cmd_run(args) -> int:
         for t in threads:
             if t.name in ("scheduler", "climate") and t.ident is not None:
                 t.join(SHUTDOWN_JOIN_S)
+        for t in threads:
+            if t.name == "monitor" and t.ident is not None:
+                t.join(SHUTDOWN_MONITOR_JOIN_S)
+        if history_loaded:
+            try:
+                monitor.save_history(history_path(args))
+            except Exception as e:  # a full disk must not keep the device open
+                log.warning("Verlauf konnte nicht gespeichert werden: %s", e)
         device.close()
         if server is not None:
             server.server_close()

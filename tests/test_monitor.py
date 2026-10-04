@@ -1,5 +1,12 @@
+import gzip
+import json
+import os
+import stat
+import tempfile
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from aquacontrol.monitor import Monitor
 from aquacontrol.sensors import Reading
@@ -154,6 +161,213 @@ class MonitorTest(unittest.TestCase):
         stop.set()
         t.join(2)
         self.assertTrue(mon.snapshot()["online"])
+
+
+class HistoryPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name, "history.json.gz")
+        self.clock = Clock()
+        self.status = load("status.bin")
+        self.mon = Monitor(open_reader=lambda: None, clock=self.clock)
+
+    def write(self, payload):
+        with gzip.open(self.path, "wt", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def fresh(self, **kw):
+        return Monitor(open_reader=lambda: None, clock=self.clock, **kw)
+
+    def fill(self, mon, seconds=25):
+        for i in range(seconds):  # buckets at t0, t0+10 finished, t0+20 open
+            mon.ingest(self.status, now=self.clock.t + i)
+        self.clock.t += seconds
+
+    def test_round_trip(self):
+        self.fill(self.mon)
+        self.mon.save_history(self.path)
+        other = self.fresh()
+        other.load_history(self.path)
+        self.assertEqual(len(other.history(60)), 2)
+        self.assertEqual(other.history(60), self.mon.history(60))
+        data = json.loads(gzip.decompress(self.path.read_bytes()))
+        self.assertEqual((data["version"], data["bucket_s"]), (1, 10))
+        self.assertIsInstance(data["saved_at"], (int, float))
+        self.assertEqual(len(data["history"]), 2)  # the open bucket is not saved
+
+    def test_loaded_history_continues_with_new_buckets(self):
+        self.fill(self.mon)
+        self.mon.save_history(self.path)
+        other = self.fresh()
+        other.load_history(self.path)
+        other.ingest(self.status, now=self.clock.t + 30)
+        other.ingest(self.status, now=self.clock.t + 41)
+        self.assertEqual([h["t"] for h in other.history(60)][-1], int((self.clock.t + 30) // 10 * 10))
+        self.assertEqual(len(other.history(60)), 3)
+
+    def test_old_and_malformed_entries_are_dropped_on_load(self):
+        now = int(self.clock.t)
+        self.write({"version": 1, "bucket_s": 10, "saved_at": now, "history": [
+            {"t": now - 6 * 3600 - 10, "temp1": 1.0},  # older than the window
+            {"t": "x", "temp1": 2.0},                  # non-numeric t
+            {"t": True, "temp1": 2.5},                 # bool is not a timestamp
+            {"temp1": 3.0},                            # no t
+            "junk",
+            {"t": now - 60, "temp1": 4.0, "bad": "x"},
+            {"t": now - 50, "temp1": 5.0},
+        ]})
+        self.mon.load_history(self.path)
+        self.assertEqual(self.mon.history(6 * 60), [{"t": now - 60, "temp1": 4.0}, {"t": now - 50, "temp1": 5.0}])
+
+    def test_other_version_or_bucket_size_is_ignored(self):
+        now = int(self.clock.t)
+        for version, bucket in ((2, 10), (1, 5)):
+            with self.subTest(version=version, bucket=bucket):
+                self.write({"version": version, "bucket_s": bucket, "saved_at": now,
+                            "history": [{"t": now - 10, "temp1": 1.0}]})
+                mon = self.fresh()
+                with self.assertLogs("aquacontrol.monitor", "INFO"):
+                    mon.load_history(self.path)
+                self.assertEqual(mon.history(60), [])
+
+    def test_load_keeps_the_maxlen(self):
+        now = int(self.clock.t) // 10 * 10
+        mon = self.fresh(history_s=60)  # 6 buckets
+        self.write({"version": 1, "bucket_s": 10, "saved_at": now,
+                    "history": [{"t": now - 10 * i, "temp1": 1.0} for i in range(12, 0, -1)]})
+        mon.load_history(self.path)
+        self.assertEqual([h["t"] for h in mon.history(60)], [now - 10 * i for i in range(6, 0, -1)])
+        self.assertEqual(mon._history.maxlen, 6)
+
+    def test_corrupt_file_warns_and_starts_empty(self):
+        good = gzip.compress(json.dumps({"version": 1, "bucket_s": 10, "saved_at": 1, "history": []}).encode())
+        cases = {"no gzip": b"das ist kein gzip", "truncated": good[:-6], "no json": gzip.compress(b"{nope"),
+                 "wrong shape": gzip.compress(b"[1, 2]"),
+                 "history not a list": gzip.compress(b'{"version": 1, "bucket_s": 10, "history": 5}'),
+                 "empty": b""}
+        for name, raw in cases.items():
+            with self.subTest(name):
+                self.path.write_bytes(raw)
+                with self.assertLogs("aquacontrol.monitor", "WARNING") as logs:
+                    self.mon.load_history(self.path)
+                self.assertIn("Verlauf", logs.output[0])
+                self.assertEqual(self.mon.history(60), [])
+
+    def test_missing_file_is_silent(self):
+        with self.assertNoLogs("aquacontrol.monitor", "WARNING"):
+            self.mon.load_history(self.path)
+        self.assertEqual(self.mon.history(60), [])
+
+    def test_unreadable_path_warns_and_starts_empty(self):
+        self.path.mkdir()  # a directory where the file should be
+        with self.assertLogs("aquacontrol.monitor", "WARNING"):
+            self.mon.load_history(self.path)
+        self.assertEqual(self.mon.history(60), [])
+
+    def test_saved_file_has_mode_0640_and_no_temp_files_remain(self):
+        self.fill(self.mon)
+        self.mon.save_history(self.path)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o640)
+        self.assertEqual(os.listdir(self.tmp.name), ["history.json.gz"])
+
+    def test_failed_save_leaves_the_old_file_intact_and_no_partial_file(self):
+        self.fill(self.mon)
+        self.mon.save_history(self.path)
+        before = self.path.read_bytes()
+        self.fill(self.mon)
+        with mock.patch("aquacontrol.monitor.os.fsync", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            self.mon.save_history(self.path)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(os.listdir(self.tmp.name), ["history.json.gz"])
+
+    def test_failed_first_save_creates_no_file(self):
+        self.fill(self.mon)
+        with mock.patch("aquacontrol.monitor.os.replace", side_effect=OSError("boom")), \
+                self.assertRaises(OSError):
+            self.mon.save_history(self.path)
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_save_does_not_hold_the_lock_while_writing(self):
+        self.fill(self.mon)
+        seen = []
+        real = os.fsync
+
+        def fsync(fd):
+            seen.append(self.mon._lock.acquire(blocking=False))  # would fail if save held the lock
+            if seen[-1]:
+                self.mon._lock.release()
+            real(fd)
+
+        with mock.patch("aquacontrol.monitor.os.fsync", fsync):
+            self.mon.save_history(self.path)
+        self.assertEqual(seen, [True])
+
+
+class PeriodicSaveTest(unittest.TestCase):
+    def test_run_saves_every_five_minutes_of_clock_time(self):
+        clock = Clock()
+        stop = threading.Event()
+        reads = []
+
+        class Reader:
+            def read(self, timeout):
+                reads.append(1)
+                clock.t += 100  # fake time: no real sleeping
+                if len(reads) >= 14:
+                    stop.set()
+                return None
+
+            def close(self):
+                pass
+
+        mon = Monitor(open_reader=Reader, clock=clock, history_path=Path("/nonexistent/history.json.gz"))
+        with mock.patch.object(mon, "save_history") as save:
+            mon.run(stop)
+        # 14 reads x 100 s = 1400 s: saves after 300, 600, 900 and 1200 s
+        self.assertEqual(save.call_count, 4)
+
+    def test_no_save_without_a_path(self):
+        clock = Clock()
+        stop = threading.Event()
+
+        class Reader:
+            def read(self, timeout):
+                clock.t += 400
+                stop.set()
+                return None
+
+            def close(self):
+                pass
+
+        mon = Monitor(open_reader=Reader, clock=clock)
+        with mock.patch.object(Monitor, "save_history") as save:
+            mon.run(stop)
+        save.assert_not_called()
+
+    def test_failing_periodic_save_is_logged_and_retried_only_at_the_next_interval(self):
+        clock = Clock()
+        stop = threading.Event()
+        reads = []
+
+        class Reader:
+            def read(self, timeout):
+                reads.append(1)
+                clock.t += 100
+                if len(reads) >= 4:
+                    stop.set()
+                return None
+
+            def close(self):
+                pass
+
+        mon = Monitor(open_reader=Reader, clock=clock, history_path=Path("/nonexistent/h.gz"))
+        with mock.patch.object(mon, "save_history", side_effect=OSError("disk full")) as save, \
+                self.assertLogs("aquacontrol.monitor", "WARNING") as logs:
+            mon.run(stop)
+        self.assertEqual(save.call_count, 1)
+        self.assertIn("Verlauf", logs.output[0])
 
 
 if __name__ == "__main__":
