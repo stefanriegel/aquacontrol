@@ -13,6 +13,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
 header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
 header h1 { font-size: 18px; margin: 0; }
@@ -44,7 +45,12 @@ input, select, button { font: inherit; color: inherit; }
 input[type=number], input[type=time], select { width: 110px; padding: 3px 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
 button { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); cursor: pointer; }
 button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+@media (prefers-color-scheme: dark) { button.primary { color: #0b1a1f; } }
 button.danger { border-color: var(--warn); color: var(--warn); }
+.fields select { width: 170px; }
+.strip-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.strip-row input[type=range] { flex: 1; max-width: 260px; }
+.strip-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
 svg.curve { width: 100%; height: 240px; background: var(--bg); border-radius: 6px; touch-action: none; }
 svg.curve circle { fill: var(--accent); cursor: grab; }
 svg.curve polyline { fill: none; stroke: var(--accent); stroke-width: 2; }

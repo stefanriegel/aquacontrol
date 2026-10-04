@@ -54,6 +54,7 @@ for (const btn of document.querySelectorAll("nav button")) {
 
 // ---------------------------------------------------------------- overview
 let lastStatus = null;
+let historyAfterStatus = false;
 
 async function refreshStatus() {
   try {
@@ -64,6 +65,7 @@ async function refreshStatus() {
     return;
   }
   const s = lastStatus;
+  if (!historyAfterStatus) { historyAfterStatus = true; refreshHistory(); } // legend labels need the names
   $("#online").textContent = s.online ? "QUADRO online" : "QUADRO offline";
   $("#online").className = `pill ${s.online ? "on" : "off"}`;
   const st = s.status;
@@ -94,7 +96,14 @@ function tile(label, value, sub = "", stale = false) {
 
 // history chart -------------------------------------------------------
 const COLORS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
-const hiddenSeries = new Set(JSON.parse(localStorageGet("hiddenSeries") || "[]"));
+const hiddenSeries = new Set(loadHiddenSeries());
+
+function loadHiddenSeries() {
+  try {
+    const v = JSON.parse(localStorageGet("hiddenSeries") || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+}
 
 function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } }
@@ -150,7 +159,7 @@ function drawChart(root, data, visible, allKeys) {
   for (let i = 0; i <= 4; i++) {
     const v = lo + ((hi - lo) * i) / 4;
     root.append(svg("line", { x1: L, x2: W, y1: y(v), y2: y(v), class: "gridline" }));
-    root.append(Object.assign(svg("text", { x: 4, y: y(v) + 4 }), { textContent: `${v.toFixed(0)}°` }));
+    root.append(Object.assign(svg("text", { x: 4, y: y(v) + 4 }), { textContent: `${v.toFixed((hi - lo) / 4 < 1 ? 1 : 0)}°` }));
   }
   for (const frac of [0, 0.5, 1]) {
     const t = t0 + (t1 - t0) * frac;
@@ -285,16 +294,19 @@ function startDrag(ev, state, i) {
     pt.x = e.clientX; pt.y = e.clientY;
     const p = pt.matrixTransform(c.getScreenCTM().inverse());
     const lo = i > 0 ? state.curve[i - 1][0] + 0.1 : 0;
-    const hi = i < 15 ? state.curve[i + 1][0] - 0.1 : 100;
-    state.curve[i] = [round1(clamp(invX(p.x), lo, hi)), round1(clamp(invY(p.y), 0, 100))];
+    const hi = i < state.curve.length - 1 ? state.curve[i + 1][0] - 0.1 : 100;
+    const t = lo > hi ? state.curve[i][0] : round1(clamp(invX(p.x), lo, hi)); // neighbours too close: keep temperature
+    state.curve[i] = [t, round1(clamp(invY(p.y), 0, 100))];
     drawCurve(state);
   };
   const up = () => {
     c.removeEventListener("pointermove", move);
     c.removeEventListener("pointerup", up);
+    c.removeEventListener("pointercancel", up);
   };
   c.addEventListener("pointermove", move);
   c.addEventListener("pointerup", up);
+  c.addEventListener("pointercancel", up);
 }
 
 function renderPointTable(state) {
@@ -437,11 +449,13 @@ loaders.backups = async () => {
     let armed = false;
     btn.addEventListener("click", async () => {
       if (!armed) { armed = true; btn.textContent = "Wirklich wiederherstellen?"; btn.className = "danger"; return; }
+      btn.disabled = true;
       try {
         showMsg($("#backup-msg"), savedText(await api("POST", `/api/backups/${encodeURIComponent(b.name)}/restore`, {})), true);
         loaders.backups();
       } catch (e) {
         showMsg($("#backup-msg"), e.message, false);
+        btn.disabled = false;
       }
     });
     tbody.append(el("tr", {}, el("td", {}, b.name), el("td", {}, btn)));
