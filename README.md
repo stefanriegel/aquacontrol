@@ -39,6 +39,30 @@ Before the first change, store a pinned backup of the device settings:
 runuser -u aquacontrol -- sh -c 'cd /opt/aquacontrol && python3 -m aquacontrol backup --pinned --reason initial'
 ```
 
+## Klima-Automatik
+
+Optional: schaltet die Raum-Klimaanlage über **Home Assistant** (REST-API) ein, wenn die Wasserkühlung dauerhaft am
+Limit läuft, und wieder aus, wenn das Wasser deutlich kühler ist. Konfiguration im Tab „Klima“; **standardmäßig
+deaktiviert** (`enabled: false`, keine HA-Adresse). Details: `docs/superpowers/specs/2026-10-04-aquacontrol-climate-design.md`.
+
+- **Ein:** Wasser (Sensor 1) ≥ 40 °C und Radiator-Lüfter (Kanäle 2 und 3) ≥ 85 % ununterbrochen seit 5 min, die
+  Klimaanlage ist laut HA aus. Dann werden Betriebsart, Solltemperatur, Preset, Lüfterstufe und die beiden Lamellen
+  gesetzt. Alle Werte sind einstellbar.
+- **Aus:** nur wenn aquacontrol sie selbst eingeschaltet hat und noch „besitzt“: Wasser ≤ 36 °C seit 10 min und
+  mindestens 30 min Laufzeit.
+- **Handbetrieb gewinnt:** Läuft die Klimaanlage schon, passiert nichts. Ändert jemand Zustand, Solltemperatur oder
+  Preset (auch durch Ausschalten), gibt aquacontrol den Besitz ab, schaltet nichts mehr und hält die Sperrzeit ein.
+  Nach einem Daemon-Neustart gilt eine laufende Klimaanlage als fremd.
+- **Gegen Pendeln:** mindestens 2 °C Abstand zwischen Ein- und Ausschalt-Temperatur, Mindestlaufzeit (30 min),
+  Sperrzeit nach dem Ausschalten (15 min) und höchstens 2 eigene Schaltvorgänge pro Stunde. Das Limit blockiert nur
+  das Einschalten, nie das Ausschalten.
+- **Fehler:** QUADRO offline oder Wasser unbekannt: nie einschalten, eine eigene Klimaanlage bleibt an. HA nicht
+  erreichbar: Wiederholung nach 1, 5, dann 15 min; die letzten 20 Ereignisse stehen im Tab.
+- **Token:** Ein Long-Lived Access Token aus dem HA-Profil. Er liegt in `secrets.json` neben `config.json`
+  (Modus 0600), wird nie geloggt und nie von der API zurückgegeben (nur `token_set`). Im Tab ist das Feld leer =
+  unverändert; „Token löschen“ entfernt ihn. „Verbindung testen“ liest nur und schaltet nichts.
+- API: `GET`/`PUT /api/climate`, `POST /api/climate/test`.
+
 ## Pushing extra sensors (e.g. GPUs from a VM)
 
 ```bash
