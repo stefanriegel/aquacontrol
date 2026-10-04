@@ -1,0 +1,62 @@
+:root {
+  --bg: #f4f6f8; --card: #ffffff; --text: #17202a; --muted: #5d6d7e; --border: #d5dbe1;
+  --accent: #0b7285; --ok: #2b8a3e; --warn: #c92a2a; --grid: #e3e8ed;
+  --s1: #1c7ed6; --s2: #e8590c; --s3: #2b8a3e; --s4: #9c36b5; --s5: #c2255c; --s6: #5c940d;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11161c; --card: #1a222b; --text: #e6edf3; --muted: #8b98a5; --border: #2c3742;
+    --accent: #3bc9db; --ok: #69db7c; --warn: #ff8787; --grid: #26313c;
+    --s1: #4dabf7; --s2: #ff922b; --s3: #69db7c; --s4: #da77f2; --s5: #f783ac; --s6: #a9e34b;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+header h1 { font-size: 18px; margin: 0; }
+.big { margin-left: auto; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.pill { padding: 2px 10px; border-radius: 999px; font-size: 13px; border: 1px solid var(--border); }
+.pill.on { color: var(--ok); border-color: var(--ok); }
+.pill.off { color: var(--warn); border-color: var(--warn); }
+nav { display: flex; gap: 4px; padding: 8px 16px; overflow-x: auto; }
+nav button { border: 0; background: none; color: var(--muted); padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.active { background: var(--card); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
+main { padding: 8px 16px 40px; max-width: 1100px; }
+h2 { font-size: 16px; margin: 24px 0 8px; display: flex; gap: 8px; align-items: center; }
+h3 { margin: 0 0 8px; font-size: 15px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.tile .label { color: var(--muted); font-size: 13px; }
+.tile .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.stale .value { color: var(--muted); }
+svg#chart { width: 100%; height: 260px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+svg text { fill: var(--muted); font-size: 11px; }
+.series { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; margin-bottom: 6px; }
+.series label { display: flex; gap: 4px; align-items: center; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.fan-editor { display: grid; grid-template-columns: minmax(240px, 1fr) 2fr; gap: 16px; }
+@media (max-width: 760px) { .fan-editor { grid-template-columns: 1fr; } }
+.fields label { display: flex; justify-content: space-between; gap: 8px; margin: 6px 0; align-items: center; }
+input, select, button { font: inherit; color: inherit; }
+input[type=number], input[type=time], select { width: 110px; padding: 3px 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
+button { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.danger { border-color: var(--warn); color: var(--warn); }
+svg.curve { width: 100%; height: 240px; background: var(--bg); border-radius: 6px; touch-action: none; }
+svg.curve circle { fill: var(--accent); cursor: grab; }
+svg.curve polyline { fill: none; stroke: var(--accent); stroke-width: 2; }
+svg.curve .now { stroke: var(--warn); stroke-dasharray: 4 3; }
+svg .gridline { stroke: var(--grid); stroke-width: 1; }
+table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 14px; }
+td.days label { margin-right: 4px; font-size: 12px; }
+.msg { font-size: 13px; }
+.msg.ok { color: var(--ok); }
+.msg.err { color: var(--warn); }
+.hint { color: var(--muted); font-size: 13px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 8px; }
+.points { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; font-size: 12px; }
+.points input { width: 100%; }
