@@ -11,6 +11,8 @@ import re
 import ssl
 import threading
 import time
+import urllib.parse
+from collections import deque
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +34,12 @@ AUTH_CACHE_S = 300
 STATIC_FILES = {"/": ("index.html", "text/html; charset=utf-8"),
                 "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                 "/style.css": ("style.css", "text/css; charset=utf-8")}
+FAIL_DELAY_S = 0.2          # pause before answering a failed login
+MAX_VERIFY_CONCURRENCY = 2  # parallel PBKDF2 verifications
+VERIFY_WAIT_S = 2.0         # how long a login waits for a verification slot before 503
+FAIL_LIMIT = 10             # failed logins per FAIL_WINDOW_S before further attempts get 429
+FAIL_WINDOW_S = 60.0
+MAX_CONNECTIONS = 32
 MODES_BY_NAME = {"fixed": p.MODE_FIXED, "target": p.MODE_TARGET, "curve": p.MODE_CURVE}
 
 
@@ -39,13 +47,27 @@ class BadRequest(ValueError):
     pass
 
 
+class LoginThrottled(Exception):
+    """Too many failed logins recently (-> 429)."""
+
+
+class LoginBusy(Exception):
+    """No password-verification slot became free in time (-> 503)."""
+
+
 def _number(body: dict, key: str) -> float | None:
     if key not in body:
         return None
     v = body[key]
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise BadRequest(f"{key} muss eine Zahl sein")
-    return float(v)
+    try:
+        f = float(v)  # OverflowError for huge ints
+    except (OverflowError, ValueError, TypeError):
+        raise BadRequest(f"{key} muss eine Zahl sein") from None
+    if not math.isfinite(f):
+        raise BadRequest(f"{key} muss eine Zahl sein")
+    return f
 
 
 class App:
@@ -64,9 +86,19 @@ class App:
         self._names: p.Names | None = None
         self._auth_cache: dict[str, float] = {}
         self._auth_lock = threading.Lock()
+        self._verify_slots = threading.BoundedSemaphore(MAX_VERIFY_CONCURRENCY)
+        self._failures: deque[float] = deque()  # monotonic times of failed Basic logins
+
+    def _throttled(self, now: float) -> bool:
+        with self._auth_lock:
+            while self._failures and now - self._failures[0] > FAIL_WINDOW_S:
+                self._failures.popleft()
+            return len(self._failures) >= FAIL_LIMIT
 
     # --- auth ---------------------------------------------------------------
     def check_basic(self, header: str | None) -> bool:
+        """True if authenticated, False if not. Raises LoginThrottled / LoginBusy when the
+        password would have to be verified but the server is protecting its CPU."""
         if not header or not header.startswith("Basic ") or not self.password_hash:
             return False
         key = hashlib.sha256(header.encode()).hexdigest()
@@ -78,8 +110,21 @@ class App:
             _, _, password = base64.b64decode(header[6:]).decode().partition(":")
         except (ValueError, UnicodeDecodeError):
             return False
-        if not verify_password(password, self.password_hash):
+        if self._throttled(now):
+            raise LoginThrottled()
+        if not self._verify_slots.acquire(timeout=VERIFY_WAIT_S):
+            raise LoginBusy()
+        try:
+            if self._throttled(time.monotonic()):  # failures may have piled up while waiting
+                raise LoginThrottled()
+            ok = verify_password(password, self.password_hash)
+        finally:
+            self._verify_slots.release()
+        if not ok:
+            with self._auth_lock:
+                self._failures.append(time.monotonic())
             return False
+        now = time.monotonic()
         with self._auth_lock:
             self._auth_cache = {k: v for k, v in self._auth_cache.items() if v > now}
             self._auth_cache[key] = now + AUTH_CACHE_S
@@ -142,7 +187,7 @@ class App:
         ctrl: dict = {}
         fan: dict = {}
         if "mode" in body:
-            if body["mode"] not in MODES_BY_NAME:
+            if not isinstance(body["mode"], str) or body["mode"] not in MODES_BY_NAME:
                 raise BadRequest("mode muss fixed, target oder curve sein")
             ctrl["mode"] = MODES_BY_NAME[body["mode"]]
         for key, target in (("fixed_percent", ctrl), ("target_c", ctrl), ("min_percent", fan), ("max_percent", fan)):
@@ -248,8 +293,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 raise BadRequest("Body zu groß")
             try:
                 return json.loads(self.rfile.read(length) or b"null")
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise BadRequest("Body ist kein gültiges JSON")
+            except (ValueError, RecursionError):  # JSON/Unicode errors, int literals over the digit limit
+                raise BadRequest("Body ist kein gültiges JSON") from None
 
         def _dispatch(self, method: str) -> None:
             path = self.path.split("?", 1)[0]
@@ -259,8 +304,20 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                     if source is None:
                         return self._error(401, "ungültiges Token")
                     return self._send(200, app.push(source, self._body()))
-                if not app.check_basic(self.headers.get("Authorization")):
-                    time.sleep(0.5)
+                auth = self.headers.get("Authorization")
+                try:
+                    authenticated = app.check_basic(auth)
+                except LoginThrottled:
+                    log.debug("login from %s rejected: too many failures", self.client_address[0])
+                    return self._send(429, {"ok": False, "error": "Zu viele Fehlversuche, bitte später erneut versuchen"},
+                                      extra={"Retry-After": str(int(FAIL_WINDOW_S))})
+                except LoginBusy:
+                    return self._send(503, {"ok": False, "error": "Server ausgelastet, bitte erneut versuchen"},
+                                      extra={"Retry-After": "2"})
+                if not authenticated:
+                    if auth:
+                        log.warning("failed login from %s", self.client_address[0])
+                    time.sleep(FAIL_DELAY_S)
                     return self._send(401, {"ok": False, "error": "Anmeldung erforderlich"},
                                       extra={"WWW-Authenticate": 'Basic realm="aquacontrol", charset="UTF-8"'})
                 self._route(method, path)
@@ -277,12 +334,19 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _route(self, method: str, path: str) -> None:
             if method == "GET" and path in STATIC_FILES:
                 fname, ctype = STATIC_FILES[path]
-                return self._send(200, (app.static_dir / fname).read_bytes(), ctype)
+                try:
+                    data = (app.static_dir / fname).read_bytes()
+                except OSError:
+                    return self._error(404, "nicht gefunden")
+                return self._send(200, data, ctype)
             if method == "GET" and path == "/api/status":
                 return self._send(200, app.status_json())
             if method == "GET" and path == "/api/history":
-                m = re.search(r"minutes=(\d+)", self.path)
-                return self._send(200, app.monitor.history(min(int(m.group(1)) if m else 60, 360)))
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+                raw = query.get("minutes", ["60"])[0]
+                if not re.fullmatch(r"[0-9]{1,3}", raw) or not 1 <= int(raw) <= 360:
+                    raise BadRequest("minutes muss eine Zahl von 1 bis 360 sein")
+                return self._send(200, app.monitor.history(int(raw)))
             if method == "GET" and path == "/api/settings":
                 return self._send(200, app.settings_json())
             if method == "GET" and path == "/api/schedule":
@@ -322,6 +386,26 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     ssl_context: ssl.SSLContext | None = None
+
+    def __init__(self, *args, **kwargs):
+        self._conn_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._conn_slots.acquire(blocking=False):  # too many open connections: drop this one
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:  # the thread did not start, so nobody else will release the slot
+            self._conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_slots.release()  # exactly once per accepted connection, also after TLS failures
 
     def finish_request(self, request, client_address):
         # TLS handshake runs here, in the per-connection thread, so a slow client

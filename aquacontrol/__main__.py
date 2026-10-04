@@ -82,7 +82,16 @@ def cmd_run(args) -> int:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     log.info("listening on %s://%s:%d", "https" if cert else "http", host, port)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        # let a running device write (scheduler or request thread) finish before the process exits
+        stop.set()
+        for t in threads:
+            if t.name == "scheduler":
+                t.join(15)
+        device.close()
+        server.server_close()
     return 0
 
 

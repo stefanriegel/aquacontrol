@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,7 +101,9 @@ class ExternalStore:
             if sid in seen:
                 raise ExternalError(f"Sensor-id {sid!r} kommt mehrfach vor")
             seen.add(sid)
-            if not isinstance(label, str) or len(label) > 40:
+            if (not isinstance(label, str) or len(label) > 40
+                    or any(unicodedata.category(ch) in ("Cc", "Cs") for ch in label)):
+                # control characters and lone surrogates (JSON escape ud800) would break the JSON output
                 raise ExternalError(f"ungültiges label für {sid}")
             # the range check also rejects nan/inf and huge ints (math.isfinite would overflow on 10**400)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not -50 <= value <= 1000:

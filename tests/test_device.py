@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 
 from aquacontrol import protocol as p
@@ -143,6 +144,34 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(errors, [])
         s = self.dev.read_settings()
         self.assertEqual((s.controllers[1].target_c, s.controllers[2].target_c), (30.0, 31.0))
+
+    def test_close_waits_for_in_flight_apply_and_then_refuses_writes(self):
+        self.fake.read_delay = 0.1  # an apply takes ~0.3 s (read, write, read-back)
+        started = threading.Event()
+        result = []
+
+        def edit():
+            started.set()
+            result.append(self.dev.apply(lambda s: p.with_controller(s, 3, target_c=38.0), backup=False))
+
+        t = threading.Thread(target=edit)
+        t.start()
+        started.wait()
+        time.sleep(0.05)  # apply is now holding the lock
+        self.dev.close()  # must block until the write is finished and verified
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].changed)
+        self.assertEqual(self.fake.commits, 1)
+        self.assertEqual(self.dev.read_settings().controllers[3].target_c, 38.0)
+        t.join()
+        writes = len(self.fake.writes)
+        for call in (lambda: self.dev.apply(lambda s: p.with_strip(s, enabled=False)),
+                     lambda: self.dev.restore(self.original),
+                     self.dev.rewrite_current):
+            with self.assertRaises(DeviceError) as cm:
+                call()
+            self.assertEqual(str(cm.exception), "Dienst wird beendet")
+        self.assertEqual(len(self.fake.writes), writes)  # lock was released again: no deadlock, no write
 
     def test_read_names(self):
         self.assertEqual(self.dev.read_names().fans[0], "Pumpe")

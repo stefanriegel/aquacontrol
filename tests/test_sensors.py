@@ -107,6 +107,17 @@ class ExternalStoreTest(unittest.TestCase):
             with self.subTest(sid=sid, value=str(value)[:8]), self.assertRaises(ExternalError):
                 self.store.put("llm-vm", body)
 
+    def test_rejects_labels_that_break_json_output(self):
+        for label in ("\ud800", "a\x00b", "x\ny", "tab\there", "del\x7f", "c1\x85"):
+            body = {"source": "llm-vm", "sensors": [{"id": "g", "label": label, "value": 1, "unit": "°C"}]}
+            with self.subTest(label=repr(label)), self.assertRaises(ExternalError):
+                self.store.put("llm-vm", body)
+        self.assertEqual(self.store.current(), [])
+
+    def test_accepts_umlauts_in_label(self):
+        body = {"source": "llm-vm", "sensors": [{"id": "g", "label": "Grafikkarte Süd °C", "value": 1, "unit": "°C"}]}
+        self.assertEqual(self.store.put("llm-vm", body), 1)
+
     def test_rejects_duplicate_ids_in_payload(self):
         s = {"id": "gpu0", "value": 1, "unit": "°C"}
         with self.assertRaises(ExternalError):

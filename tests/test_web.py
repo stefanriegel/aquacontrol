@@ -1,11 +1,15 @@
 import base64
 import http.client
 import json
+import logging
+import socket
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from aquacontrol.auth import hash_password, hash_token
 from aquacontrol.backups import BackupStore
@@ -16,6 +20,7 @@ from aquacontrol.monitor import Monitor
 from aquacontrol.schedule import Scheduler
 from aquacontrol.sensors import ExternalStore
 from aquacontrol.validate import make_check
+from aquacontrol import web
 from aquacontrol.web import App, make_server
 from tests.fixtures import load
 
@@ -24,6 +29,10 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 
 class WebTest(unittest.TestCase):
     def setUp(self):
+        # failed logins are logged at warning level; keep the test output pristine
+        handler = logging.NullHandler()
+        logging.getLogger("aquacontrol.web").addHandler(handler)
+        self.addCleanup(logging.getLogger("aquacontrol.web").removeHandler, handler)
         self.tmp = tempfile.TemporaryDirectory()
         self.fake = FakeTransport(load("settings_live.bin"), load("names.bin"))
         self.backups = BackupStore(Path(self.tmp.name, "backups"))
@@ -36,7 +45,7 @@ class WebTest(unittest.TestCase):
         self.app = App(self.device, self.monitor, self.scheduler, self.backups, self.config, ExternalStore(),
                        hash_password("pw", iterations=1000), {"llm-vm": hash_token("tok")}, STATIC)
         self.server = make_server(self.app, "127.0.0.1", 0)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
         self.auth = "Basic " + base64.b64encode(b"admin:pw").decode()
 
@@ -170,6 +179,140 @@ class WebTest(unittest.TestCase):
         self.assertIn(b"<title>", body)
         status, _ = self.req("GET", "/etc/passwd")
         self.assertEqual(status, 404)
+
+    def test_client_input_never_causes_500(self):
+        big = 10 ** 400  # float(big) overflows
+        digits = b"1" * 5000  # beyond Python's int-string conversion limit
+        cases = [
+            ("unhashable mode", "/api/settings/fan/2", {"body": {"mode": []}}),
+            ("unhashable mode (object)", "/api/settings/fan/2", {"body": {"mode": {}}}),
+            ("huge target_c", "/api/settings/fan/2", {"raw": b'{"target_c": 1' + b"0" * 400 + b"}"}),
+            ("huge curve value", "/api/settings/fan/2",
+             {"raw": json.dumps({"curve": [[20 + i, big if i == 3 else 50] for i in range(16)]}).encode()}),
+            ("int literal over the digit limit", "/api/settings/fan/2", {"raw": b'{"target_c": ' + digits + b"}"}),
+            ("deeply nested JSON", "/api/settings/fan/2", {"raw": b"[" * 20000 + b"]" * 20000}),
+        ]
+        for name, path, kw in cases:
+            with self.subTest(name):
+                status, resp = self.req("PUT", path, **kw)
+                self.assertEqual(status, 400, resp)
+                self.assertIn("error", resp)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_int_literal_over_digit_limit_in_push_body_is_400(self):
+        status, _ = self.req("POST", "/api/external", auth=False, headers={"Authorization": "Bearer tok"},
+                             raw=b'{"source": 1' + b"1" * 5000 + b"}")
+        self.assertEqual(status, 400)
+
+    def test_history_minutes(self):
+        status, body = self.req("GET", "/api/history?minutes=30")
+        self.assertEqual(status, 200)
+        status, _ = self.req("GET", "/api/history")
+        self.assertEqual(status, 200)
+        for q in ("minutes=" + "9" * 5000, "minutes=0", "minutes=361", "minutes=abc", "minutes=-5", "minutes="):
+            with self.subTest(q=q[:20]):
+                status, resp = self.req("GET", "/api/history?" + q)
+                self.assertEqual(status, 400, resp)
+                self.assertIn("error", resp)
+
+    def test_missing_static_file_is_404(self):
+        self.app.static_dir = Path(self.tmp.name, "no-static")
+        status, resp = self.req("GET", "/app.js")
+        self.assertEqual(status, 404)
+        self.assertIn("error", resp)
+
+    def test_push_label_with_surrogate_or_control_char_is_400_and_status_survives(self):
+        for label in ("\\ud800", "a\\u0000b", "x\\ny"):
+            with self.subTest(label=label):
+                raw = ('{"source": "llm-vm", "sensors": [{"id": "gpu0", "label": "%s", "value": 45, "unit": "\u00b0C"}]}'
+                       % label).encode()
+                status, _ = self.req("POST", "/api/external", auth=False,
+                                     headers={"Authorization": "Bearer tok"}, raw=raw)
+                self.assertEqual(status, 400)
+        status, _ = self.req("GET", "/api/status")
+        self.assertEqual(status, 200)
+
+    def _login(self, password):
+        return "Basic " + base64.b64encode(b"admin:" + password.encode()).decode()
+
+    def test_failed_login_throttle_returns_429_without_pbkdf2(self):
+        real = web.verify_password
+        with mock.patch.object(web, "verify_password", side_effect=real) as verify, \
+                mock.patch.object(web, "FAIL_DELAY_S", 0):
+            self.assertEqual(self.req("GET", "/api/status")[0], 200)  # caches the good session
+            self.assertEqual(verify.call_count, 1)
+            for i in range(10):
+                status, _ = self.req("GET", "/api/status", auth=False,
+                                     headers={"Authorization": self._login(f"wrong{i}")})
+                self.assertEqual(status, 401)
+            self.assertEqual(verify.call_count, 11)
+            status, resp = self.req("GET", "/api/status", auth=False,
+                                    headers={"Authorization": self._login("wrong-again")})
+            self.assertEqual(status, 429, resp)
+            self.assertIn("error", resp)
+            # even the correct password is not verified (no PBKDF2) while throttled ...
+            self.assertEqual(self.req("GET", "/api/status", auth=False,
+                                      headers={"Authorization": self._login("pw2")})[0], 429)
+            self.assertEqual(verify.call_count, 11)
+            # ... but the cached session keeps working
+            self.assertEqual(self.req("GET", "/api/status")[0], 200)
+            self.assertEqual(verify.call_count, 11)
+
+    def test_failed_login_throttle_expires(self):
+        with mock.patch.object(web, "FAIL_DELAY_S", 0):
+            for i in range(10):
+                self.req("GET", "/api/status", auth=False, headers={"Authorization": self._login(f"wrong{i}")})
+            self.assertEqual(self.req("GET", "/api/status")[0], 429)
+            self.app._failures.clear()
+            self.app._failures.extend([time.monotonic() - web.FAIL_WINDOW_S - 1] * 10)  # all outside the window
+            self.assertEqual(self.req("GET", "/api/status")[0], 200)
+
+    def test_failed_login_is_logged_without_password(self):
+        with mock.patch.object(web, "FAIL_DELAY_S", 0), self.assertLogs("aquacontrol.web", "WARNING") as cm:
+            self.req("GET", "/api/status", auth=False, headers={"Authorization": self._login("geheim123")})
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("127.0.0.1", cm.output[0])
+        self.assertNotIn("geheim123", cm.output[0])
+
+    def test_login_without_free_verification_slot_is_503(self):
+        slots = [self.app._verify_slots.acquire() for _ in range(web.MAX_VERIFY_CONCURRENCY)]
+        self.assertTrue(all(slots))
+        try:
+            with mock.patch.object(web, "VERIFY_WAIT_S", 0.05):
+                status, resp = self.req("GET", "/api/status")
+            self.assertEqual(status, 503, resp)
+            self.assertIn("error", resp)
+        finally:
+            for _ in slots:
+                self.app._verify_slots.release()
+        self.assertEqual(self.req("GET", "/api/status")[0], 200)
+
+    def test_connection_cap_drops_excess_and_releases_slots(self):
+        self.server._conn_slots = threading.BoundedSemaphore(1)
+        port = self.server.server_address[1]
+        first = socket.create_connection(("127.0.0.1", port), timeout=5)  # idle, holds the only slot
+        try:
+            deadline = time.monotonic() + 5
+            while self.server._conn_slots.acquire(blocking=False) and time.monotonic() < deadline:
+                self.server._conn_slots.release()  # slot still free: handler thread not started yet
+                time.sleep(0.01)
+            second = socket.create_connection(("127.0.0.1", port), timeout=5)
+            try:
+                self.assertEqual(second.recv(1), b"")  # closed immediately by the server
+            finally:
+                second.close()
+        finally:
+            first.close()
+        deadline = time.monotonic() + 5
+        while True:  # the slot comes back once the first connection's thread ends
+            try:
+                status, _ = self.req("GET", "/api/status")
+                if status == 200:
+                    break
+            except OSError:
+                pass
+            self.assertLess(time.monotonic(), deadline, "slot never released")
+            time.sleep(0.05)
 
 
 if __name__ == "__main__":

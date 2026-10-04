@@ -43,6 +43,16 @@ class Device:
         self._backups = backups
         self._check = check
         self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        """Wait for a running apply/restore to finish, then refuse all further writes."""
+        with self._lock:
+            self._closed = True
+
+    def _ensure_open(self) -> None:  # call with the lock held
+        if self._closed:
+            raise DeviceError("Dienst wird beendet")
 
     def _read_report(self) -> bytes:
         try:
@@ -71,6 +81,7 @@ class Device:
     def apply(self, mutate: Callable[[Settings], Settings], *, backup: bool = True,
               reason: str = "") -> ApplyResult:
         with self._lock:
+            self._ensure_open()
             old_report = self._read_report()
             old = decode_settings(old_report)
             new = mutate(old)
@@ -83,6 +94,7 @@ class Device:
     def restore(self, report: bytes, reason: str = "restore") -> ApplyResult:
         check_settings_report(report)
         with self._lock:
+            self._ensure_open()
             old_report = self._read_report()
             self._check(decode_settings(old_report), decode_settings(report))
             if report == old_report:
@@ -92,6 +104,7 @@ class Device:
     def rewrite_current(self) -> None:
         """Write the current settings back unchanged (hardware self-test only)."""
         with self._lock:
+            self._ensure_open()
             report = self._read_report()
             self._write(report)
             self._verify(report)
