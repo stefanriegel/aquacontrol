@@ -258,11 +258,13 @@ class ClimateController:
     dict at the end, so status() never waits for a hanging Home Assistant."""
 
     def __init__(self, get_snapshot: Callable[[], dict], client_factory: Callable[[], object | None],
-                 get_config: Callable[[], ClimateConfig], clock: Callable[[], float] = time.time):
+                 get_config: Callable[[], ClimateConfig], clock: Callable[[], float] = time.time,
+                 sleep: Callable[[float], object] = time.sleep):
         self._get_snapshot = get_snapshot
         self._client_factory = client_factory
         self._get_config = get_config
         self._clock = clock
+        self._sleep = sleep
         self._lock = threading.Lock()
         self._owned_since: float | None = None
         self._fingerprint: tuple | None = None
@@ -272,6 +274,7 @@ class ClimateController:
         self._next_poll = 0.0          # a foreign (manually running) AC is looked at again only from here on
         self._switches: list[float] = []
         self._failures = 0
+        self._ha_ok = self._ha_failed = False  # what Home Assistant did during the current tick
         self._retry_at: float | None = None
         self._last_error: str | None = None
         self._events: deque[tuple[float, str]] = deque(maxlen=EVENT_LIMIT)
@@ -339,6 +342,7 @@ class ClimateController:
         self._failures, self._retry_at, self._last_error = 0, None, None
 
     def _fail(self, now: float, what: str, error: Exception) -> None:
+        self._ha_failed = True
         self._failures += 1
         wait = BACKOFF_S[min(self._failures, len(BACKOFF_S)) - 1]
         self._retry_at = now + wait
@@ -366,11 +370,17 @@ class ClimateController:
         except HAError as e:
             self._fail(now, "Status abfragen", e)
             return None
-        self._ok()
+        self._ha_ok = True  # not _ok(): a failing service call right after must still escalate the backoff
         return st
 
     # --- the state machine --------------------------------------------------------------------------
     def _tick(self, now: float) -> None:
+        self._ha_ok = self._ha_failed = False
+        self._decide(now)
+        if self._ha_ok and not self._ha_failed:  # Home Assistant answered and the whole decision went through
+            self._ok()
+
+    def _decide(self, now: float) -> None:
         cfg = self._get_config()
         if not cfg.enabled:
             if self._owned_since is not None:
@@ -467,7 +477,7 @@ class ClimateController:
         except HAError as e:
             self._fail(now, "Ausschalten", e)
             return
-        self._ok()
+        self._ha_ok = True
         self._record_switch(now)  # counts as a switch, but is never blocked by the limit
         self._owned_since = self._fingerprint = self._off_since = None
         self._cooldown_until = now + cfg.min_off_minutes * 60
@@ -534,6 +544,7 @@ class ClimateController:
                 error = ex
                 break
             done += 1
+            self._ha_ok = True
         if done:
             self._record_switch(now)  # a half-done switch-on counts as well
         st, read_error = None, None
@@ -546,8 +557,6 @@ class ClimateController:
             self._fail(now, "Einschalten", error)
         elif read_error is not None:
             self._fail(now, "Status nach dem Einschalten", read_error)
-        else:
-            self._ok()
         if st is not None and st.get("state") not in ("off", *UNAVAILABLE):
             self._owned_since, self._fingerprint = now, self._fingerprint_of(st)
             self._arming_since = self._off_since = None

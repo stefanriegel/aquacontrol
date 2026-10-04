@@ -29,6 +29,10 @@ class FakeClient:
         self.log = []
         self.failing = set()      # "get", "domain.service", or "*"
         self.ignore_on = False    # the AC reports "off" although it was told to switch on (cloud lag)
+        self.clock = lambda: 0.0
+        self.stamps = []          # (what, time) of every call: "get", "domain.service"
+        self.lag = 0              # state changes become visible only after this many get_state calls
+        self._queued = []         # [remaining reads, change] pairs
         self.states = {
             E: {"state": "off", "attributes": {"temperature": 24.0, "preset_mode": "Normal", "fan_mode": "Automatic"}},
             H: {"state": "auto", "attributes": {}},
@@ -41,13 +45,26 @@ class FakeClient:
 
     def get_state(self, entity_id):
         self.log.append(("get", entity_id))
+        self.stamps.append(("get", self.clock()))
         self._maybe_fail("get")
+        for item in list(self._queued):
+            item[0] -= 1
+            if item[0] < 0:
+                self._queued.remove(item)
+                item[1]()
         return {"entity_id": entity_id, **{k: (dict(v) if isinstance(v, dict) else v)
                                            for k, v in self.states[entity_id].items()}}
 
     def call(self, domain, service, data):
         self.log.append(("call", domain, service, dict(data)))
+        self.stamps.append((f"{domain}.{service}", self.clock()))
         self._maybe_fail(f"{domain}.{service}")
+        if self.lag:
+            self._queued.append([self.lag, lambda: self._apply(service, data)])
+        else:
+            self._apply(service, data)
+
+    def _apply(self, service, data):
         ent = self.states[data["entity_id"]]
         if service == "set_hvac_mode" and not self.ignore_on:
             ent["state"] = data["hvac_mode"]
@@ -104,7 +121,15 @@ class Rig:
         self.cfg = parse_climate_config(merge_climate(DEFAULT_CLIMATE,
                                                       {"enabled": True, "ha_url": "http://ha.example:8123", **patch}))
         self.snapshot = hot()
-        self.ctrl = ClimateController(lambda: self.snapshot, self.factory, lambda: self.cfg, clock=lambda: self.now)
+        self.client.clock = lambda: self.now
+        self.sleeps = []
+        self.ctrl = ClimateController(lambda: self.snapshot, self.factory, lambda: self.cfg, clock=lambda: self.now,
+                                      sleep=self.sleeps.append)
+
+    def attempts(self, what):
+        """Minutes (relative to the first one) at which `what` was tried."""
+        times = [t for w, t in self.client.stamps if w == what]
+        return [round((t - times[0]) / MIN, 1) for t in times]
 
     def factory(self):
         self.factory_calls += 1
@@ -743,6 +768,28 @@ class ErrorTest(unittest.TestCase):
         self.assertEqual(r.client.calls, ON_CALLS)
         self.assertNotEqual(r.state(), "owned")
         self.assertEqual(r.status()["switches_last_hour"], 1)
+
+
+class BackoffEscalationTest(unittest.TestCase):
+    """The backoff must also escalate when only the service call fails and the status read works."""
+
+    def test_persistent_switch_on_failure_escalates(self):
+        r = Rig()
+        r.client.failing = {"climate.set_hvac_mode"}
+        r.tick()
+        r.advance(5 + 37)
+        self.assertEqual(r.attempts("climate.set_hvac_mode"), [0.0, 1.0, 6.0, 21.0, 36.0])
+
+    def test_persistent_turn_off_failure_escalates(self):
+        r = Rig()
+        r.bring_on()
+        r.advance(30)
+        r.client.failing = {"climate.turn_off"}
+        r.client.stamps.clear()
+        r.set(cool())
+        r.advance(10 + 37)
+        self.assertEqual(r.attempts("climate.turn_off"), [0.0, 1.0, 6.0, 21.0, 36.0])
+        self.assertEqual(r.state(), "owned")
 
 
 class DisabledTest(unittest.TestCase):
