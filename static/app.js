@@ -410,6 +410,12 @@ function ledSourceLocked(source, sensorCount) {
   return !(Number.isInteger(source) && source >= 0 && source < sensorCount);
 }
 
+// Which range-end labels to draw [start, end]: a threshold on (or, clamped, beyond) an end draws its own label there.
+function ledRangeLabels(range, thresholds) {
+  const finite = thresholds.filter((t) => Number.isFinite(t));
+  return [!finite.some((t) => t <= range[0]), !finite.some((t) => t >= range[1])];
+}
+
 function ledPreview(state) {
   const W = 400, X0 = 6, X1 = 394, Y = 26, H = 20;
   const bar = state.preview;
@@ -424,8 +430,9 @@ function ledPreview(state) {
     t.textContent = String(v);
     bar.append(t);
   };
-  label(state.led.range[0], "start");
-  label(state.led.range[1], "end");
+  const [showStart, showEnd] = ledRangeLabels(state.led.range, state.thresholds);
+  if (showStart) label(state.led.range[0], "start");
+  if (showEnd) label(state.led.range[1], "end");
   for (const t of state.thresholds) {
     if (!Number.isFinite(t)) continue;
     bar.append(svg("line", { x1: x(t), x2: x(t), y1: Y - 3, y2: Y + H + 3, stroke: "currentColor", "stroke-width": 2 }));

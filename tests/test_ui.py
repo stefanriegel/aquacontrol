@@ -96,6 +96,14 @@ class LedUiTest(unittest.TestCase):
         self.assertEqual(run_js("ledFraction", [99, self.RANGE]), 1)
         self.assertEqual(run_js("ledFraction", [5, [5, 5]]), 0)
 
+    def test_a_threshold_on_a_range_end_replaces_that_end_label(self):
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, [35, 45]]), [True, True])
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, [20, 45]]), [False, True])
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, [35, 70]]), [True, False])
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, [20, 70]]), [False, False])
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, [None, 5]]), [False, True])  # clamped onto the end
+        self.assertEqual(run_js("ledRangeLabels", [self.RANGE, []]), [True, True])
+
     def test_new_threshold_goes_between_the_last_one_and_the_end(self):
         self.assertEqual(run_js("ledNewThreshold", [[35, 45], self.RANGE]), 57)
         self.assertEqual(run_js("ledNewThreshold", [[35, 69], self.RANGE]), 70)
