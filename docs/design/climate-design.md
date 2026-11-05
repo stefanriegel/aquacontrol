@@ -21,7 +21,7 @@ immer Vorrang.
   - `select.panasonic_ac_panasonic_ac_horizontal_swing_mode`: auto, left, left_center, center, right_center, right
   - `select.panasonic_ac_panasonic_ac_vertical_swing_mode`: swing, auto, up, up_center, center, down_center, down
 - **Services:**
-  - `climate.set_hvac_mode`, `climate.set_temperature`, `climate.set_preset_mode`, `climate.set_fan_mode`, `climate.turn_off`
+  - `climate.set_temperature` (mit `hvac_mode`), `climate.set_preset_mode`, `climate.set_fan_mode`, `climate.turn_off`
   - `select.select_option`
 
 ## 3. Verhalten
@@ -43,12 +43,16 @@ Alle Bedingungen müssen gleichzeitig gelten:
 
 ### Einschaltaktion
 Reihenfolge:
-1. `set_hvac_mode(cool)`
-2. `set_temperature(20)`
-3. `set_preset_mode(Quiet)`
-4. `set_fan_mode(Automatic)`
-5. `select_option(horizontal, left)`
-6. `select_option(vertical, down_center)`
+1. `set_temperature(hvac_mode=cool, temperature=20)`: Betriebsart und Temperatur in **einem** Aufruf, das schaltet ein
+2. `set_preset_mode(Quiet)`, nur wenn HA ein anderes Preset zeigt
+3. `set_fan_mode(Automatic)`, nur wenn HA eine andere Lüfterstufe zeigt
+4. `select_option(horizontal, left)`
+5. `select_option(vertical, down_center)`
+
+Nach jedem Aufruf wartet aquacontrol `SETTLE_S` (3 s). Die Klimaanlage hängt über ESPHome an HA und beantwortet einen
+Befehl nach etwa einer Sekunde. Ein Befehl, der vorher kommt, wird aus ihrem letzten gemeldeten Zustand gebaut und macht
+den vorigen rückgängig. So geschah es 2026-11-03 bis 2026-11-05 mit sechs Aufrufen direkt hintereinander: HA zeigte
+„cool 20 °C“ und in derselben Sekunde wieder „off 21,5 °C“, und aquacontrol hielt das für ein Ausschalten von Hand.
 
 Alle Werte sind konfigurierbar. Danach liest aquacontrol den Zustand und merkt sich einen **Fingerabdruck** dessen, was es
 gesetzt hat: hvac-Zustand, Zieltemperatur, Preset. Ab dann gilt **Besitz = aquacontrol**.

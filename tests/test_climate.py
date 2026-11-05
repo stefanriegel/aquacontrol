@@ -1,3 +1,4 @@
+import copy
 import threading
 import unittest
 
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 
 from aquacontrol.climate import (BACKOFF_S, DEFAULT_CLIMATE, INTERVAL_S, ClimateController, make_client_factory,
                                  merge_climate, parse_climate_config)
+from aquacontrol import climate as climate_mod
 from aquacontrol.ha import HAClient, HAError
 
 E = "climate.panasonic_ac_panasonic_ac"
@@ -12,14 +14,16 @@ H = "select.panasonic_ac_panasonic_ac_horizontal_swing_mode"
 V = "select.panasonic_ac_panasonic_ac_vertical_swing_mode"
 MIN = 60
 
+# The fake AC starts with fan mode "Automatic" (already the configured one, so it is not sent) and preset "Normal".
 ON_CALLS = [
-    ("climate", "set_hvac_mode", {"entity_id": E, "hvac_mode": "cool"}),
-    ("climate", "set_temperature", {"entity_id": E, "temperature": 20.0}),
+    ("climate", "set_temperature", {"entity_id": E, "hvac_mode": "cool", "temperature": 20.0}),
     ("climate", "set_preset_mode", {"entity_id": E, "preset_mode": "Quiet"}),
-    ("climate", "set_fan_mode", {"entity_id": E, "fan_mode": "Automatic"}),
     ("select", "select_option", {"entity_id": H, "option": "left"}),
     ("select", "select_option", {"entity_id": V, "option": "down_center"}),
 ]
+# switching on again: the AC still shows the preset from the first time, so it is not sent again
+ON_AGAIN = [c for c in ON_CALLS if c[1] != "set_preset_mode"]
+ESPHOME_ANSWER_S = 1.0  # the real AC answered a command within about a second (2026-11-05)
 
 
 class FakeClient:
@@ -34,6 +38,11 @@ class FakeClient:
         self.lag = 0              # state changes become visible only after this many get_state calls
         self.lag_services = None  # restrict the lag to these services (None: all)
         self._queued = []         # [remaining reads, change] pairs
+        # like the ESPHome panasonic_ac component: a command sent before the AC answered the previous one is built
+        # from the AC's last report, which undoes the earlier change (seen live 2026-11-03..05)
+        self.esphome = False
+        self._unanswered = 0.0    # seconds until the AC answers the last command
+        self._reported = None     # what the AC reported last (esphome mode)
         self.states = {
             E: {"state": "off", "attributes": {"temperature": 24.0, "preset_mode": "Normal", "fan_mode": "Automatic"}},
             H: {"state": "auto", "attributes": {}},
@@ -70,10 +79,25 @@ class FakeClient:
         self.log.append(("call", domain, service, dict(data)))
         self.stamps.append((f"{domain}.{service}", self.clock()))
         self._maybe_fail(f"{domain}.{service}")
+        if self.esphome:
+            if self._reported is None:
+                self._reported = copy.deepcopy(self.states[E])
+            if self._unanswered > 0:
+                self.states[E] = copy.deepcopy(self._reported)
+            self._apply(service, data)
+            self._unanswered = ESPHOME_ANSWER_S
+            return
         if self.lag and (self.lag_services is None or service in self.lag_services):
             self._queued.append([self.lag, lambda: self._apply(service, data)])
         else:
             self._apply(service, data)
+
+    def elapse(self, seconds):
+        """The controller slept: the AC answers a pending command (esphome mode)."""
+        if self._unanswered > 0:
+            self._unanswered -= seconds
+            if self._unanswered <= 0:
+                self._reported = copy.deepcopy(self.states[E])
 
     def _apply(self, service, data):
         ent = self.states[data["entity_id"]]
@@ -81,6 +105,8 @@ class FakeClient:
             ent["state"] = data["hvac_mode"]
         elif service == "set_temperature":
             ent["attributes"]["temperature"] = data["temperature"]
+            if "hvac_mode" in data and not self.ignore_on:
+                ent["state"] = data["hvac_mode"]
         elif service == "set_preset_mode":
             ent["attributes"]["preset_mode"] = data["preset_mode"]
         elif service == "set_fan_mode":
@@ -135,7 +161,15 @@ class Rig:
         self.client.clock = lambda: self.now
         self.sleeps = []
         self.ctrl = ClimateController(lambda: self.snapshot, self.factory, lambda: self.cfg, clock=lambda: self.now,
-                                      sleep=self.sleeps.append)
+                                      sleep=self._sleep)
+
+    def _sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.client.elapse(seconds)
+
+    def polls(self):
+        """The read-back pauses (0.5 s each), without the pauses between commands."""
+        return [s for s in self.sleeps if s == 0.5]
 
     def attempts(self, what):
         """Minutes (relative to the first one) at which `what` was tried."""
@@ -427,7 +461,7 @@ class TurnOnTest(unittest.TestCase):
         r.tick()
         r.advance(5)
         self.assertEqual([c[2] for c in r.client.calls], [
-            {"entity_id": E, "hvac_mode": "dry"}, {"entity_id": E, "temperature": 22.5},
+            {"entity_id": E, "hvac_mode": "dry", "temperature": 22.5},
             {"entity_id": E, "preset_mode": "Powerful"}, {"entity_id": E, "fan_mode": "3"},
             {"entity_id": H, "option": "center"}, {"entity_id": V, "option": "up"}])
 
@@ -638,7 +672,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         self.assertEqual(r.state(), "cooldown")
         self.assertIsNotNone(r.status()["cooldown_until"])
         r.advance(0.5)
-        self.assertEqual(r.client.calls, ON_CALLS)
+        self.assertEqual(r.client.calls, ON_AGAIN)
 
     def test_lockout_is_configurable(self):
         r = Rig(max_switches_per_hour=10, min_off_minutes=20)
@@ -649,7 +683,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         r.advance(19.5)
         self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         r.advance(0.5)
-        self.assertEqual(r.client.calls, ON_CALLS)
+        self.assertEqual(r.client.calls, ON_AGAIN)
 
     def test_switch_limit_blocks_switching_on(self):
         r = Rig()  # two switches per hour
@@ -667,7 +701,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         self.assertEqual(r.client.log, [("get", E)])  # only the one look when arming started
         r.now = t_on + 3600 + 1
         r.tick()
-        self.assertEqual(r.client.calls, ON_CALLS)
+        self.assertEqual(r.client.calls, ON_AGAIN)
 
     def test_off_is_never_blocked_by_the_limit(self):
         r = Rig(max_switches_per_hour=1)
@@ -685,12 +719,12 @@ class LockoutAndLimitTest(unittest.TestCase):
             r.advance(2)
             r.set(cool())
             r.advance(2)
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 2)
+        self.assertEqual(r.client.count("climate", "set_temperature"), 2)
         self.assertEqual(r.client.count("climate", "turn_off"), 2)   # the 4th switch is an off: never blocked
         self.assertEqual(r.status()["switches_last_hour"], 4)
         r.set(hot())
         r.advance(20)                                                # lockout over, but the limit is reached
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 2)
+        self.assertEqual(r.client.count("climate", "set_temperature"), 2)
         self.assertIn("Schaltlimit", r.status()["reason"])
 
     def test_hand_over_does_not_count_as_a_switch(self):
@@ -704,7 +738,7 @@ class LockoutAndLimitTest(unittest.TestCase):
         r.client.log.clear()
         r.set(hot())
         r.advance(5.5)
-        self.assertEqual(r.client.calls, ON_CALLS)  # switch 2 is still allowed
+        self.assertEqual(r.client.calls, ON_AGAIN)  # switch 2 is still allowed
 
 
 class ErrorTest(unittest.TestCase):
@@ -794,10 +828,10 @@ class ErrorTest(unittest.TestCase):
 
     def test_half_executed_switch_on_counts_and_takes_ownership(self):
         r = Rig()
-        r.client.failing = {"climate.set_temperature"}
+        r.client.failing = {"climate.set_preset_mode"}
         r.tick()
         r.advance(5)
-        self.assertEqual([c[1] for c in r.client.calls], ["set_hvac_mode", "set_temperature"])  # stops at the error
+        self.assertEqual([c[1] for c in r.client.calls], ["set_temperature", "set_preset_mode"])  # stops at the error
         self.assertEqual(r.state(), "owned")           # AC is running now (state != off)
         self.assertIn("Einschalten", r.status()["last_error"])
         r.client.failing = set()
@@ -813,18 +847,18 @@ class ErrorTest(unittest.TestCase):
         r.client.ac("off")                              # AC gets switched off by hand afterwards
         r.client.failing = set()
         r.advance(40)
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)   # one attempt, limit holds
+        self.assertEqual(r.client.count("climate", "set_temperature"), 1)   # one attempt, limit holds
 
     def test_first_call_failing_is_not_a_switch(self):
         r = Rig(max_switches_per_hour=1)
-        r.client.failing = {"climate.set_hvac_mode"}
+        r.client.failing = {"climate.set_temperature"}
         r.tick()
         r.advance(5)
         self.assertEqual(r.state(), "arming")
         self.assertEqual(r.status()["switches_last_hour"], 0)
         r.client.failing = set()
         r.advance(2)
-        self.assertEqual(r.client.count("climate", "set_temperature"), 1)
+        self.assertEqual(r.client.count("climate", "set_temperature"), 2)  # the failed attempt and the one that worked
         self.assertEqual(r.state(), "owned")
 
     def test_ac_still_off_after_switch_on_is_not_owned(self):
@@ -857,6 +891,68 @@ class ErrorTest(unittest.TestCase):
         self.assertEqual(r.status()["switches_last_hour"], 1)
 
 
+class EsphomeSwitchOnTest(unittest.TestCase):
+    """The AC is an ESPHome device: a command that arrives before the AC answered the previous one is built from the
+    AC's last report and undoes the earlier change. Seen live 2026-11-03..05: six calls in a row showed cool 20 °C and,
+    in the same second, off 21.5 °C again; aquacontrol took that for a person switching the AC off."""
+
+    def test_switch_on_survives_an_ac_that_rebuilds_commands_from_its_last_report(self):
+        r = Rig()
+        r.client.esphome = True
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.state(), "owned")
+        self.assertFalse(r.status()["unconfirmed"])
+        r.advance(3)
+        self.assertEqual(r.state(), "owned")
+        self.assertNotIn("Handbetrieb", " ".join(e["message"] for e in r.status()["events"]))
+        ac = r.client.states[E]
+        self.assertEqual((ac["state"], ac["attributes"]["temperature"], ac["attributes"]["preset_mode"]),
+                         ("cool", 20.0, "Quiet"))
+        self.assertEqual((r.client.states[H]["state"], r.client.states[V]["state"]), ("left", "down_center"))
+
+    def test_mode_and_temperature_go_in_one_call(self):
+        r = Rig()
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.client.calls[0],
+                         ("climate", "set_temperature", {"entity_id": E, "hvac_mode": "cool", "temperature": 20.0}))
+        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 0)
+
+    def test_preset_and_fan_mode_already_set_are_not_sent_again(self):
+        r = Rig()
+        r.client.ac(preset_mode="quiet", fan_mode="Automatic")   # the preset compares without case
+        r.tick()
+        r.advance(5)
+        self.assertEqual([c[1] for c in r.client.calls], ["set_temperature", "select_option", "select_option"])
+        self.assertEqual(r.state(), "owned")
+        self.assertFalse(r.status()["unconfirmed"])
+
+    def test_a_different_fan_mode_is_sent(self):
+        r = Rig()
+        r.client.ac(fan_mode="3")
+        r.tick()
+        r.advance(5)
+        self.assertIn(("climate", "set_fan_mode", {"entity_id": E, "fan_mode": "Automatic"}), r.client.calls)
+
+    def test_every_command_is_followed_by_a_pause_for_the_answer(self):
+        r = Rig()
+        r.tick()
+        r.advance(5)
+        settle = climate_mod.SETTLE_S
+        self.assertGreater(settle, ESPHOME_ANSWER_S)
+        self.assertEqual([s for s in r.sleeps if s == settle], [settle] * len(ON_CALLS))
+        calls = [i for i, (kind, *_) in enumerate(r.client.log) if kind == "call"]
+        self.assertEqual(len(calls), len(ON_CALLS))
+
+    def test_no_pause_after_a_failed_command(self):
+        r = Rig()
+        r.client.failing = {"climate.set_temperature"}
+        r.tick()
+        r.advance(5)
+        self.assertEqual(r.sleeps, [])
+
+
 class ReadBackTest(unittest.TestCase):
     """HA reflects a service call only after about half a second (cloud integration): the read-back must wait."""
 
@@ -864,7 +960,7 @@ class ReadBackTest(unittest.TestCase):
         r = Rig()
         r.tick()
         r.advance(5)
-        self.assertEqual(r.sleeps, [])
+        self.assertEqual(r.polls(), [])
         self.assertEqual(r.status()["unconfirmed"], False)
 
     def test_waits_until_state_temperature_and_preset_are_reflected(self):
@@ -872,7 +968,7 @@ class ReadBackTest(unittest.TestCase):
         r.client.lag = 3                      # three reads still show the old values
         r.tick()
         r.advance(5)
-        self.assertEqual(r.sleeps, [0.5, 0.5, 0.5])
+        self.assertEqual(r.polls(), [0.5, 0.5, 0.5])
         self.assertEqual(r.state(), "owned")
         self.assertFalse(r.status()["unconfirmed"])
         r.advance(3)
@@ -881,10 +977,10 @@ class ReadBackTest(unittest.TestCase):
 
     def test_waits_for_the_preset_and_temperature_not_just_the_state(self):
         r = Rig()
-        r.client.lag, r.client.lag_services = 4, {"set_temperature", "set_preset_mode"}
+        r.client.lag, r.client.lag_services = 4, {"set_preset_mode"}
         r.tick()
         r.advance(5)
-        self.assertEqual(len(r.sleeps), 4)    # state was "cool" from the first read, attributes came later
+        self.assertEqual(len(r.polls()), 4)  # state and temperature came at once, the preset later
         r.advance(3)
         self.assertEqual(r.state(), "owned")
 
@@ -893,12 +989,12 @@ class ReadBackTest(unittest.TestCase):
         r.client.lag = 1000
         r.tick()
         r.advance(5)
-        self.assertEqual(len(r.sleeps), 20)
-        self.assertEqual(sum(r.sleeps), 10.0)
+        self.assertEqual(len(r.polls()), 20)
+        self.assertEqual(sum(r.polls()), 10.0)
 
     def test_not_reflected_but_running_takes_ownership_marked_unconfirmed(self):
         r = Rig()
-        r.client.lag, r.client.lag_services = 1000, {"set_temperature", "set_preset_mode"}
+        r.client.lag, r.client.lag_services = 1000, {"set_preset_mode"}
         r.tick()
         r.advance(5)
         st = r.status()
@@ -909,7 +1005,7 @@ class ReadBackTest(unittest.TestCase):
 
     def test_late_values_confirm_instead_of_handing_over(self):
         r = Rig()
-        r.client.lag, r.client.lag_services = 27, {"set_temperature", "set_preset_mode"}  # visible after the poll
+        r.client.lag, r.client.lag_services = 27, {"set_preset_mode"}  # visible after the poll
         r.tick()
         r.advance(5)
         self.assertTrue(r.status()["unconfirmed"])
@@ -933,7 +1029,7 @@ class ReadBackTest(unittest.TestCase):
         self.assertIn("nicht bestätigt", r.status()["events"][0]["message"])
         r.advance(1.5)
         self.assertEqual(r.state(), "owned")
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)   # no second switch-on
+        self.assertEqual(r.client.count("climate", "set_temperature"), 1)   # no second switch-on
         self.assertFalse(r.status()["unconfirmed"])
 
     def test_late_but_different_values_are_not_taken_over(self):
@@ -950,7 +1046,7 @@ class ReadBackTest(unittest.TestCase):
 
     def test_unconfirmed_ac_switched_to_another_mode_by_a_person_is_handed_over_not_confirmed(self):
         r = Rig()
-        r.client.lag, r.client.lag_services = 1000, {"set_temperature", "set_preset_mode"}
+        r.client.lag, r.client.lag_services = 1000, {"set_preset_mode"}
         r.tick()
         r.advance(5)
         self.assertTrue(r.status()["unconfirmed"])       # HA shows cool, 24 deg, Normal
@@ -1099,7 +1195,7 @@ class ManualOffTest(unittest.TestCase):
                       "spätestens ", st["reason"])
         self.assertRegex(st["reason"], r"spätestens \d\d:\d\d\)$")
         self.assertIsNotNone(st["manual_off_until"])
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 0)
+        self.assertEqual(r.client.count("climate", "set_temperature"), 0)
 
     def test_owned_ac_switched_off_by_hand_is_not_switched_on_again(self):
         r = self.owned_then_off_by_hand()
@@ -1129,7 +1225,8 @@ class ManualOffTest(unittest.TestCase):
                 r.advance(4.5)
                 self.assertEqual(r.client.calls, [])     # arming again takes the full on-time
                 r.advance(1)
-                self.assertEqual(r.client.calls, ON_CALLS)
+                # a foreign AC never got our preset, an owned one still shows it
+                self.assertEqual(r.client.calls, ON_AGAIN if make == self.owned_then_off_by_hand else ON_CALLS)
 
     def test_owned_ac_switched_off_at_38_degrees_stays_off_until_the_water_was_cool(self):
         """Verified scenario of the re-review (O1): water between 36 and 40 deg must not end the pause."""
@@ -1154,7 +1251,7 @@ class ManualOffTest(unittest.TestCase):
         self.assertIsNone(r.status()["manual_off_until"])
         r.set(hot())
         r.advance(5.5)
-        self.assertEqual(r.client.calls, ON_CALLS)
+        self.assertEqual(r.client.calls, ON_AGAIN)
 
     def test_the_pause_survives_interruptions_without_a_cool_reading(self):
         for name, interrupt in (("water below on-threshold", snap(39.0, (30.0, 90.0, 90.0, 30.0))),
@@ -1187,7 +1284,8 @@ class ManualOffTest(unittest.TestCase):
                 r.advance((until - r.now) / 60 - 0.5)
                 self.assertEqual(r.client.calls, [])
                 r.advance(1.5)
-                self.assertEqual(r.client.calls, ON_CALLS)
+                # a foreign AC never got our preset, an owned one still shows it
+                self.assertEqual(r.client.calls, ON_AGAIN if make == self.owned_then_off_by_hand else ON_CALLS)
 
     def test_ceiling_is_configurable_and_defaults_to_two_hours(self):
         r = self.owned_then_off_by_hand()
@@ -1238,7 +1336,7 @@ class ManualOffTest(unittest.TestCase):
         self.assertIsNone(r.status()["manual_off_until"])
         r.set(hot())
         r.advance(25)
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)
+        self.assertEqual(r.client.count("climate", "set_temperature"), 1)
 
     def test_disabling_clears_the_pause(self):
         r = self.owned_then_off_by_hand()
@@ -1265,7 +1363,7 @@ class ManualOffTest(unittest.TestCase):
         self.assertEqual(r.status()["switches_last_hour"], 2)            # switch-on + our off
         r.set(hot())
         r.advance(25)
-        self.assertEqual(r.client.count("climate", "set_hvac_mode"), 1)  # may switch on again after the lockout
+        self.assertEqual(r.client.count("climate", "set_temperature"), 1)  # may switch on again after the lockout
 
 
 class BackoffEscalationTest(unittest.TestCase):
@@ -1273,10 +1371,10 @@ class BackoffEscalationTest(unittest.TestCase):
 
     def test_persistent_switch_on_failure_escalates(self):
         r = Rig()
-        r.client.failing = {"climate.set_hvac_mode"}
+        r.client.failing = {"climate.set_temperature"}
         r.tick()
         r.advance(5 + 37)
-        self.assertEqual(r.attempts("climate.set_hvac_mode"), [0.0, 1.0, 6.0, 21.0, 36.0])
+        self.assertEqual(r.attempts("climate.set_temperature"), [0.0, 1.0, 6.0, 21.0, 36.0])
 
     def test_persistent_turn_off_failure_escalates(self):
         r = Rig()

@@ -250,6 +250,9 @@ HOUR_S = 3600
 UNAVAILABLE = ("unavailable", "unknown")
 READBACK_POLL_S = 0.5    # after switching on, HA shows the new state after about half a second (cloud integration)
 READBACK_MAX_S = 10.0
+# The AC (ESPHome) answers a command within about a second. A command sent before that answer is built from the AC's
+# last report and undoes the previous one (seen 2026-11-03..05: cool 20 °C, then off 21.5 °C in the same second).
+SETTLE_S = 3.0
 CONFIRM_WINDOW_S = 600   # how long an unconfirmed switch-on is re-checked on the following cycles
 TEMP_TOLERANCE_C = 0.25
 MISMATCHES_TO_HAND_OVER = 2
@@ -655,7 +658,7 @@ class ClimateController:
                             if state in UNAVAILABLE else
                             f"Klimaanlage läuft bereits (Handbetrieb, Zustand {state}), aquacontrol schaltet nichts")
             return
-        self._turn_on(now, cfg, client, water)
+        self._turn_on(now, cfg, client, water, st)
 
     def _probe(self, now: float, cfg: ClimateConfig, client) -> bool:
         """One look at the AC when arming starts, so that a manually running AC is known before the arming time is
@@ -675,13 +678,19 @@ class ClimateController:
             self._next_poll = now + cfg.on.minutes * 60  # the regular look at the end of arming is not skipped
         return False
 
-    def _turn_on(self, now: float, cfg: ClimateConfig, client, water: float | None) -> None:
+    def _turn_on(self, now: float, cfg: ClimateConfig, client, water: float | None, before: dict) -> None:
+        """Mode and temperature go in one call (that is what switches the AC on). Preset and fan mode are sent only
+        when HA shows other values. After every command the controller waits SETTLE_S for the AC's answer, so the
+        next command is not built from the AC's old state."""
         ac, e = cfg.ac, cfg.entity_id
-        steps = [
-            ("climate", "set_hvac_mode", {"entity_id": e, "hvac_mode": ac.hvac_mode}),
-            ("climate", "set_temperature", {"entity_id": e, "temperature": ac.temperature}),
-            ("climate", "set_preset_mode", {"entity_id": e, "preset_mode": ac.preset}),
-            ("climate", "set_fan_mode", {"entity_id": e, "fan_mode": ac.fan_mode}),
+        attrs = before.get("attributes") if isinstance(before.get("attributes"), dict) else {}
+        steps = [("climate", "set_temperature",
+                  {"entity_id": e, "hvac_mode": ac.hvac_mode, "temperature": ac.temperature})]
+        if not self._preset_equal(attrs.get("preset_mode"), ac.preset):
+            steps.append(("climate", "set_preset_mode", {"entity_id": e, "preset_mode": ac.preset}))
+        if attrs.get("fan_mode") != ac.fan_mode:
+            steps.append(("climate", "set_fan_mode", {"entity_id": e, "fan_mode": ac.fan_mode}))
+        steps += [
             ("select", "select_option", {"entity_id": cfg.horizontal_select, "option": ac.horizontal}),
             ("select", "select_option", {"entity_id": cfg.vertical_select, "option": ac.vertical}),
         ]
@@ -694,6 +703,7 @@ class ClimateController:
                 break
             done += 1
             self._ha_ok = True
+            self._sleep(SETTLE_S)
         if done:
             self._record_switch(now)  # a half-done switch-on counts as well
         st, read_error = None, None
