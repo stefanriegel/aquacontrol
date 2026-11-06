@@ -123,6 +123,21 @@ class Device:
             self._write(report)
             self._verify(report)
 
+    def write_live(self, report: bytes) -> None:
+        """Send a settings report WITHOUT the commit (report 0x02) and verify the read-back.
+
+        aquasuite saves to flash only through the commit, so the device should apply this report without
+        persisting it: after a power cycle the stored settings are back. Used by `led-live-test` to check
+        that on the real QUADRO. No backup and no rollback: nothing is saved."""
+        check_settings_report(report)
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._t.set_feature(report)
+            except OSError as e:
+                raise DeviceError(f"Live-Schreiben fehlgeschlagen: {e}") from e
+            self._verify(report)
+
     def _write_verified(self, old_report: bytes, new_report: bytes, backup: bool,
                         reason: str) -> ApplyResult:
         name = self._backups.save(old_report, reason) if backup and self._backups else None

@@ -8,15 +8,18 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
 from .auth import hash_password, hash_token, new_token
 from .backups import BackupStore
 from .climate import ClimateController, make_client_factory
+from .colors import hex_to_hsv1536
 from .config import AppConfig, ConfigError, load_daemon_config, update_daemon_config
 from .device import Device
 from .monitor import Monitor
+from .protocol import LED_MODE_STATIC, NUM_LEDS, decode_settings, encode_settings, with_led
 from .schedule import Scheduler
 from .sensors import ExternalStore, read_host_sensors
 from .transport import HidrawReader, HidrawTransport
@@ -203,6 +206,45 @@ def cmd_selftest_write(args) -> int:
     return 0
 
 
+def cmd_led_live_test(args) -> int:
+    """Hardware probe: does the QUADRO show a settings write before the commit?
+
+    Recolours one static-colour LED controller WITHOUT the commit (report 0x02), holds it for a few seconds and
+    then writes the original report back, again without the commit. Nothing is saved to flash. Stop the daemon
+    first, so that no scheduled write commits the test colour in between."""
+    if not 1 <= args.led <= NUM_LEDS:
+        print(f"LED-Controller muss 1–{NUM_LEDS} sein", file=sys.stderr)
+        return 1
+    try:
+        colour = hex_to_hsv1536(args.color)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    config = AppConfig(args.app_config)
+    store = BackupStore(config.backup_dir, config.backup_keep)
+    device = Device(HidrawTransport(), store, make_check({}))
+    original = device.read_report()
+    settings = decode_settings(original)
+    index = args.led - 1
+    if settings.leds[index].mode != LED_MODE_STATIC:
+        print(f"LED-Controller {args.led} ist keine statische Farbe, Test nur dort", file=sys.stderr)
+        return 1
+    live = encode_settings(with_led(settings, index, colors=(colour,)), original)
+    if live == original:
+        print(f"LED-Controller {args.led} hat schon diese Farbe", file=sys.stderr)
+        return 1
+    print("Backup:", store.save(original, "led-live-test"))
+    try:
+        device.write_live(live)
+        print(f"LED-Controller {args.led} live auf {args.color} gesetzt, ohne Commit; Gerät meldet den neuen Stand. "
+              f"Halte {args.seconds:g} s.", flush=True)
+        time.sleep(args.seconds)
+    finally:
+        device.write_live(original)
+        print("Ursprünglicher Stand live zurückgeschrieben und bestätigt, ohne Commit.", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aquacontrol")
     parser.add_argument("--daemon-config", default=DEFAULT_DAEMON)
@@ -225,6 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     bak.add_argument("--pinned", action="store_true")
     bak.set_defaults(func=cmd_backup)
     sub.add_parser("selftest-write").set_defaults(func=cmd_selftest_write)
+    live = sub.add_parser("led-live-test", help="LED-Farbe ohne Commit setzen und zurücksetzen (Hardware-Test)")
+    live.add_argument("--led", type=int, default=2, help="statischer LED-Controller 1–8 (Standard 2)")
+    live.add_argument("--color", required=True, help="#rrggbb")
+    live.add_argument("--seconds", type=float, default=20.0)
+    live.set_defaults(func=cmd_led_live_test)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     return args.func(args)

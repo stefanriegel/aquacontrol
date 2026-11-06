@@ -272,3 +272,70 @@ class RunFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedLiveTestCommandTest(unittest.TestCase):
+    """`led-live-test`: hardware probe that recolours one static LED controller without the commit and then
+    writes the original report back, also without the commit."""
+
+    def setUp(self):
+        from aquacontrol.fake import FakeTransport
+        from tests.fixtures import load
+        self.tmp = tempfile.TemporaryDirectory()
+        self.app = Path(self.tmp.name, "config.json")
+        self.backup_dir = Path(self.tmp.name, "b")
+        self.app.write_text(json.dumps({"backup_dir": str(self.backup_dir), "schedule": []}))
+        self.original = load("settings_live.bin")
+        self.fake = FakeTransport(self.original, load("names.bin"))
+        patcher = mock.patch.object(main_mod, "HidrawTransport", lambda: self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cmd(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()), mock.patch.object(main_mod.time, "sleep") as sleep:
+            code = main_mod.main(["--app-config", str(self.app), "led-live-test", *args])
+        return code, out.getvalue(), sleep
+
+    def test_recolours_then_restores_without_any_commit(self):
+        from aquacontrol import protocol as p
+        code, out, sleep = self.run_cmd("--led", "2", "--color", "#ff00ff", "--seconds", "20")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.fake.writes), 2)
+        live = p.decode_settings(self.fake.writes[0])
+        self.assertEqual(live.leds[1].palette[0], (1280, 255, 255))   # magenta
+        self.assertEqual(live.leds[0], p.decode_settings(self.original).leds[0])  # temperature LEDs untouched
+        self.assertEqual(self.fake.writes[1], self.original)
+        self.assertEqual(self.fake.settings, self.original)
+        self.assertEqual(self.fake.commits, 0)
+        sleep.assert_called_once_with(20.0)
+        self.assertEqual(len(list(self.backup_dir.iterdir())), 1)       # backup of the original first
+        self.assertIn("#ff00ff", out)
+
+    def test_restores_even_when_interrupted(self):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()), \
+                mock.patch.object(main_mod.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                main_mod.main(["--app-config", str(self.app), "led-live-test", "--led", "2", "--color", "#0000ff"])
+        self.assertEqual(self.fake.writes[-1], self.original)
+        self.assertEqual(self.fake.settings, self.original)
+        self.assertEqual(self.fake.commits, 0)
+
+    def test_refuses_a_controller_that_is_not_a_static_colour(self):
+        code, out, _ = self.run_cmd("--led", "1", "--color", "#ff00ff")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_refuses_an_invalid_colour(self):
+        code, out, _ = self.run_cmd("--led", "2", "--color", "magenta")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_refuses_the_colour_it_already_has(self):
+        code, out, _ = self.run_cmd("--led", "2", "--color", "#01ff00")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.writes, [])

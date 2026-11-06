@@ -268,3 +268,43 @@ class DeviceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveWriteTest(unittest.TestCase):
+    """write_live sends a settings report without the commit (report 0x02), so nothing is saved to flash."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original = load("settings_live.bin")
+        self.fake = FakeTransport(self.original, load("names.bin"))
+        self.dev = Device(self.fake, BackupStore(self.tmp.name), make_check({0: 25.0}))
+        s = p.decode_settings(self.original)
+        self.blue = p.encode_settings(p.with_led(s, 1, colors=((1023, 255, 255),)), self.original)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_writes_the_report_without_commit(self):
+        self.dev.write_live(self.blue)
+        self.assertEqual(self.fake.writes, [self.blue])
+        self.assertEqual(self.fake.commits, 0)
+        self.assertEqual(self.dev.read_report(), self.blue)
+
+    def test_rejects_a_report_with_a_broken_crc(self):
+        corrupt = bytearray(self.blue)
+        corrupt[50] ^= 1
+        with self.assertRaises(p.ProtocolError):
+            self.dev.write_live(bytes(corrupt))
+        self.assertEqual(self.fake.writes, [])
+
+    def test_a_device_that_does_not_take_the_report_raises(self):
+        self.fake.ignore_writes = True
+        with self.assertRaises(DeviceError):
+            self.dev.write_live(self.blue)
+        self.assertEqual(self.fake.commits, 0)
+
+    def test_refuses_after_close(self):
+        self.dev.close()
+        with self.assertRaises(DeviceError):
+            self.dev.write_live(self.blue)
+        self.assertEqual(self.fake.writes, [])
