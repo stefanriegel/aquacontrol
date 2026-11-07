@@ -35,7 +35,7 @@ report offset.
 ## The user's configuration (2026-10-04)
 
 - **C1, LEDs 1–30:** Farbschalter on "Wasser Temp". Green below 35 °C, yellow from 35 to 45 °C, red from 45 °C.
-- **C2, LEDs 31–45:** static colour, green (h=511).
+- **C2, LEDs 31–45:** static colour, green (h=511). No physical LEDs are attached there (checked 2026-11-07).
 - **C3–C8:** unused. C7/C8 hold leftover blink-like values but are not shown in aquasuite.
 
 ## Commit
@@ -43,6 +43,9 @@ report offset.
 aquasuite sends output report 0x02 (the 11-byte commit) about 4 s after each settings write, and it saves only through
 that commit. aquacontrol sends the same bytes as a feature report, as the kernel driver does. Both persist: a
 power-cycle test confirmed it (power-up counter 220 → 221, settings kept).
+
+Without the commit the device accepts a settings report and reads it back, but does not apply it to the LEDs
+(tested 2026-11-07, see [hardware-verification.md](hardware-verification.md)). Every visible change is a flash write.
 
 ## Safe-editing rules derived from this
 

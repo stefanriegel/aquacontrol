@@ -11,6 +11,8 @@ These tests were run on a real Aquacomputer QUADRO with **firmware 1033**, conne
 | Persistence | Target temperature changed, then the host was shut down so the QUADRO lost power. The device power-up counter went from 220 to 221, and the setting was kept. |
 | LED strip | Brightness 60, strip off (flag `0x0002`) and on again were confirmed visually. |
 | Schedule | Test rules switched the strip off and on at the configured minute. |
+| Write without commit (2026-11-07) | A settings report sent **without** the commit is accepted and read back byte-identical, but the LEDs do not change: a live colour on C1 never showed. Only the commit makes a change visible, and the commit persists to flash. So there is no flash-free way to change an LED colour through report 0x03. Probe: `led-live-test` on branch `led-live-probe` (not merged). |
+| LED controller 2 (2026-11-07) | C2 (LEDs 31–45) lights nothing on this build: a committed magenta on it was not visible. The strip has only the 30 LEDs of C1. |
 | Curve semantics | The device maps curve percentages linearly into [min, max]. Pump example: curve 4.31 % with min 28.02 / max 90.3 gives an output of 30.70 %, and the device reported 30.7 %. |
 | LED layout | Decoded by driving aquasuite and diffing captured USB writes, see [led-layout.md](led-layout.md). The editor reproduces aquasuite's writes byte for byte. |
 | systemd hardening | `systemd-analyze security aquacontrol` scores 1.6 ("OK"). Read, fan write and rollback, LED write, schedule, sensor push and clean stop all work under the hardened unit. |
