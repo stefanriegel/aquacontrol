@@ -19,7 +19,8 @@ from .colors import hex_to_hsv1536
 from .config import AppConfig, ConfigError, load_daemon_config, update_daemon_config
 from .device import Device
 from .monitor import Monitor
-from .protocol import LED_MODE_STATIC, NUM_LEDS, decode_settings, encode_settings, with_led
+from .protocol import (LED_MODE_COLOR_SWITCH, LED_MODE_STATIC, NUM_LEDS, decode_settings, encode_settings,
+                       with_led)
 from .schedule import Scheduler
 from .sensors import ExternalStore, read_host_sensors
 from .transport import HidrawReader, HidrawTransport
@@ -209,9 +210,11 @@ def cmd_selftest_write(args) -> int:
 def cmd_led_live_test(args) -> int:
     """Hardware probe: does the QUADRO show a settings write before the commit?
 
-    Recolours one static-colour LED controller WITHOUT the commit (report 0x02), holds it for a few seconds and
-    then writes the original report back, again without the commit. Nothing is saved to flash. Stop the daemon
-    first, so that no scheduled write commits the test colour in between."""
+    Recolours one LED controller WITHOUT the commit (report 0x02), holds it for a few seconds and then writes the
+    original report back, again without the commit. Nothing is saved to flash. A static controller gets the new
+    colour; a Farbschalter only gets a new coolest colour (palette entry 0, shown below the first threshold), so its
+    warning colours and thresholds stay. Stop the daemon first, so that no scheduled write commits the test colour
+    in between."""
     if not 1 <= args.led <= NUM_LEDS:
         print(f"LED-Controller muss 1–{NUM_LEDS} sein", file=sys.stderr)
         return 1
@@ -226,10 +229,15 @@ def cmd_led_live_test(args) -> int:
     original = device.read_report()
     settings = decode_settings(original)
     index = args.led - 1
-    if settings.leds[index].mode != LED_MODE_STATIC:
-        print(f"LED-Controller {args.led} ist keine statische Farbe, Test nur dort", file=sys.stderr)
+    mode = settings.leds[index].mode
+    if mode not in (LED_MODE_STATIC, LED_MODE_COLOR_SWITCH):
+        print(f"LED-Controller {args.led} ist weder statische Farbe noch Farbschalter", file=sys.stderr)
         return 1
+    # with_led replaces only the leading palette entries: the static colour, or the Farbschalter's coolest colour
     live = encode_settings(with_led(settings, index, colors=(colour,)), original)
+    if mode == LED_MODE_COLOR_SWITCH:
+        print(f"LED-Controller {args.led} ist ein Farbschalter: geändert wird nur seine kühlste Farbe "
+              "(unter der ersten Schwelle).", flush=True)
     if live == original:
         print(f"LED-Controller {args.led} hat schon diese Farbe", file=sys.stderr)
         return 1

@@ -325,8 +325,23 @@ class LedLiveTestCommandTest(unittest.TestCase):
         self.assertEqual(self.fake.settings, self.original)
         self.assertEqual(self.fake.commits, 0)
 
-    def test_refuses_a_controller_that_is_not_a_static_colour(self):
+    def test_colour_switch_changes_only_its_coolest_colour(self):
+        # C1 is the Farbschalter on the water temperature: below the first threshold it shows palette[0]
+        from aquacontrol import protocol as p
+        before = p.decode_settings(self.original).leds[0]
+        self.assertEqual(before.mode, p.LED_MODE_COLOR_SWITCH)
         code, out, _ = self.run_cmd("--led", "1", "--color", "#ff00ff")
+        self.assertEqual(code, 0)
+        live = p.decode_settings(self.fake.writes[0]).leds[0]
+        self.assertEqual(live.palette[0], (1280, 255, 255))
+        self.assertEqual(live.palette[1:], before.palette[1:])          # yellow and red warnings unchanged
+        self.assertEqual(live.thresholds, before.thresholds)
+        self.assertEqual(self.fake.writes[1], self.original)
+        self.assertEqual(self.fake.commits, 0)
+        self.assertIn("kühlste Farbe", out)
+
+    def test_refuses_an_unused_controller(self):
+        code, out, _ = self.run_cmd("--led", "3", "--color", "#ff00ff")
         self.assertEqual(code, 1)
         self.assertEqual(self.fake.writes, [])
 
